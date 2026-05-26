@@ -1,8 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import gsap from 'gsap';
 
 // --- State Variables ---
-let scene, camera, renderer, controls;
+let scene, camera, renderer, composer, bloomPass, controls, sliders = [];
 let particleSystem = null;
 let lineSystem = null; // System for interconnection links
 let rawPixelData = null; // Will store CPU side pixel data for exports
@@ -30,8 +35,18 @@ let isAnimatingCam = false;
 
 // Camera Kinetics State
 let enableAutoOrbit = false;
-let driftAmp = 10;
+let driftAmp = 0;
 let driftSpeed = 0.5;
+
+// Video Recording State
+let mediaRecorder = null;
+let recordedChunks = [];
+let isRecording = false;
+
+// Custom Keyframe Timeline State
+let customKeyframes = [];
+window.customTimelinePlaying = false;
+window.customTimelineTl = null;
 
 // Procedural pattern generator as fallback if CORS errors occur
 const USE_PROCEDURAL_FALLBACK_ON_CORS = true;
@@ -46,6 +61,9 @@ const shaderUniforms = {
   uScatterAmp: { value: 0.0 },
   uScatterFreq: { value: 0.05 },
   uScatterSpeed: { value: 0.0 },
+  uEnableFloating: { value: true },
+  uOrganicFieldStrength: { value: 0.0 },
+  uOrganicFieldSpeed: { value: 1.0 },
   uTime: { value: 0.0 },
   uColorMode: { value: 0 }, // 0: original, 1: greyscale, 2: depth, 3: tint
   uTintColor: { value: new THREE.Color('#00ffcc') },
@@ -69,7 +87,10 @@ const shaderUniforms = {
   // Link specific uniforms
   uLinkOpacity: { value: 0.30 },
   uLinkColorMode: { value: 0 }, // 0: match-particles, 1: tint, 2: depth-gradient
-  uLinkTintColor: { value: new THREE.Color('#ffffff') }
+  uLinkTintColor: { value: new THREE.Color('#ffffff') },
+  linewidth: { value: 2.0 },
+  resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+  uLinkGlow: { value: 1.5 }
 };
 
 // --- Custom Shaders for Real-Time Performance ---
@@ -82,6 +103,9 @@ const vertexShader = `
   uniform float uTime;
   uniform bool uSizeAttenuation;
   uniform float uModelScale;
+  uniform float uOrganicFieldStrength;
+  uniform float uOrganicFieldSpeed;
+  uniform bool uEnableFloating;
 
   attribute float pixelVal;
   attribute vec3 originalColor;
@@ -109,18 +133,31 @@ const vertexShader = `
     vec3 displaced = vec3(position.x * uModelScale, position.y * uModelScale, position.z);
     displaced.z += pixelVal * uDepthScale;
 
-    // Apply per-particle scatter/jitter
-    if (uScatterAmp > 0.0) {
-      vec3 seedX = position + vec3(uTime * uScatterSpeed, 11.1, 17.3);
-      vec3 seedY = position + vec3(uTime * uScatterSpeed, 23.4, 31.8);
-      vec3 seedZ = position + vec3(uTime * uScatterSpeed, 47.9, 93.1);
+    // Per-Particle Organic Floating
+    if (uEnableFloating && uScatterAmp > 0.0) {
+      // Create a unique pseudo-random phase for each particle based on its position
+      float phase = hash(position * 123.456) * 100.0;
+      float t = uTime * uScatterSpeed;
+      float f = uScatterFreq * 10.0; 
       
-      vec3 offset = vec3(
-        hash(seedX) - 0.5,
-        hash(seedY) - 0.5,
-        hash(seedZ) - 0.5
+      vec3 floatOffset = vec3(
+        sin(t + phase) * cos(t * 0.8 * f + phase * 1.2),
+        sin(t * 1.1 * f + phase * 2.0) * cos(t * 0.9 + phase * 0.8),
+        sin(t * 0.9 + phase * 1.5) * cos(t * 1.2 * f + phase)
       ) * uScatterAmp;
-      displaced += offset;
+      
+      displaced += floatOffset;
+    }
+
+    // Organic Field Displacement (Mathematical Attractor)
+    if (uOrganicFieldStrength > 0.0) {
+      vec3 p = position * 0.01 + vec3(uTime * uOrganicFieldSpeed * 0.5);
+      vec3 field = vec3(
+        sin(p.y * 2.1) * cos(p.z * 1.7),
+        sin(p.z * 2.1) * cos(p.x * 1.7),
+        sin(p.x * 2.1) * cos(p.y * 1.7)
+      );
+      displaced += field * uOrganicFieldStrength * 100.0;
     }
 
     vZPosition = displaced.z;
@@ -298,16 +335,28 @@ const lineVertexShader = `
   uniform float uScatterSpeed;
   uniform float uTime;
   uniform float uModelScale;
+  uniform float uOrganicFieldStrength;
+  uniform float uOrganicFieldSpeed;
+  uniform bool uEnableFloating;
 
-  attribute float pixelVal;
-  attribute vec3 originalColor;
-  attribute vec2 depthGradient;
+  uniform float linewidth;
+  uniform vec2 resolution;
+
+  attribute vec3 instanceStart;
+  attribute vec3 instanceEnd;
+  attribute vec3 instanceColorStart;
+  attribute vec3 instanceColorEnd;
+
+  attribute float pixelValStart;
+  attribute float pixelValEnd;
+  attribute vec2 depthGradientStart;
+  attribute vec2 depthGradientEnd;
 
   varying vec3 vColor;
   varying float vZPosition;
   varying vec3 vNormal;
+  varying vec2 vUv;
 
-  // GPU Noise Utilities
   float hash(vec3 p) {
     p = fract(p * 0.3183099 + vec3(0.1, 0.1, 0.1));
     p += dot(p, p.yzx + 33.33);
@@ -315,41 +364,123 @@ const lineVertexShader = `
   }
 
   void main() {
-    vColor = originalColor;
+    vColor = (position.y < 0.5) ? instanceColorStart : instanceColorEnd;
+    vUv = uv;
 
-    // Apply scale to X and Y coordinates and displace Z along depth modulator
-    vec3 displaced = vec3(position.x * uModelScale, position.y * uModelScale, position.z);
-    displaced.z += pixelVal * uDepthScale;
+    // 1. Calculate displaced endpoint positions on GPU
+    vec3 displacedStart = vec3(instanceStart.x * uModelScale, instanceStart.y * uModelScale, instanceStart.z);
+    displacedStart.z += pixelValStart * uDepthScale;
 
-    // Apply per-particle scatter/jitter
-    if (uScatterAmp > 0.0) {
-      vec3 seedX = position + vec3(uTime * uScatterSpeed, 11.1, 17.3);
-      vec3 seedY = position + vec3(uTime * uScatterSpeed, 23.4, 31.8);
-      vec3 seedZ = position + vec3(uTime * uScatterSpeed, 47.9, 93.1);
+    vec3 displacedEnd = vec3(instanceEnd.x * uModelScale, instanceEnd.y * uModelScale, instanceEnd.z);
+    displacedEnd.z += pixelValEnd * uDepthScale;
+
+    // 2. Apply Organic Floating offsets to start and end
+    if (uEnableFloating && uScatterAmp > 0.0) {
+      float phaseStart = hash(instanceStart * 123.456) * 100.0;
+      float phaseEnd = hash(instanceEnd * 123.456) * 100.0;
+      float t = uTime * uScatterSpeed;
+      float f = uScatterFreq * 10.0;
       
-      vec3 offset = vec3(
-        hash(seedX) - 0.5,
-        hash(seedY) - 0.5,
-        hash(seedZ) - 0.5
+      displacedStart += vec3(
+        sin(t + phaseStart) * cos(t * 0.8 * f + phaseStart * 1.2),
+        sin(t * 1.1 * f + phaseStart * 2.0) * cos(t * 0.9 + phaseStart * 0.8),
+        sin(t * 0.9 + phaseStart * 1.5) * cos(t * 1.2 * f + phaseStart)
       ) * uScatterAmp;
-      displaced += offset;
+      
+      displacedEnd += vec3(
+        sin(t + phaseEnd) * cos(t * 0.8 * f + phaseEnd * 1.2),
+        sin(t * 1.1 * f + phaseEnd * 2.0) * cos(t * 0.9 + phaseEnd * 0.8),
+        sin(t * 0.9 + phaseEnd * 1.5) * cos(t * 1.2 * f + phaseEnd)
+      ) * uScatterAmp;
     }
 
-    vZPosition = displaced.z;
+    // 3. Apply Organic Flow Field Attractor to start and end
+    if (uOrganicFieldStrength > 0.0) {
+      vec3 pStart = instanceStart * 0.01 + vec3(uTime * uOrganicFieldSpeed * 0.5);
+      vec3 pEnd = instanceEnd * 0.01 + vec3(uTime * uOrganicFieldSpeed * 0.5);
+      
+      vec3 fieldStart = vec3(
+        sin(pStart.y * 2.1) * cos(pStart.z * 1.7),
+        sin(pStart.z * 2.1) * cos(pStart.x * 1.7),
+        sin(pStart.x * 2.1) * cos(pStart.y * 1.7)
+      );
+      vec3 fieldEnd = vec3(
+        sin(pEnd.y * 2.1) * cos(pEnd.z * 1.7),
+        sin(pEnd.z * 2.1) * cos(pEnd.x * 1.7),
+        sin(pEnd.x * 2.1) * cos(pEnd.y * 1.7)
+      );
+      
+      displacedStart += fieldStart * uOrganicFieldStrength * 100.0;
+      displacedEnd += fieldEnd * uOrganicFieldStrength * 100.0;
+    }
 
-    // Compute local normal from analytical depth gradients
+    // Set depth-gradient-based Z-position for fragment shader
+    vZPosition = (position.y < 0.5) ? displacedStart.z : displacedEnd.z;
+
+    // Compute normal from analytical gradients for shading
     float S = 0.0;
     if (abs(uModelScale) > 0.001) {
       S = uDepthScale / uModelScale;
     }
-    vec3 localNormal = vec3(-S * depthGradient.x, -S * depthGradient.y, 1.0);
+    vec2 localGrad = (position.y < 0.5) ? depthGradientStart : depthGradientEnd;
+    vec3 localNormal = vec3(-S * localGrad.x, -S * localGrad.y, 1.0);
     localNormal = normalize(localNormal);
-
-    // Transform normal to world coordinates for shading
     vNormal = normalize((modelMatrix * vec4(localNormal, 0.0)).xyz);
 
-    vec4 mvPosition = modelViewMatrix * vec4(displaced, 1.0);
-    gl_Position = projectionMatrix * mvPosition;
+    // 4. Line expansion algorithm (screen-aligned quad rendering)
+    float aspect = resolution.x / resolution.y;
+
+    vec4 start = modelViewMatrix * vec4(displacedStart, 1.0);
+    vec4 end = modelViewMatrix * vec4(displacedEnd, 1.0);
+
+    bool perspective = (projectionMatrix[2][3] == -1.0);
+    if (perspective) {
+      // Trim segment ends if they cross the near plane
+      float a = projectionMatrix[2][2];
+      float b = projectionMatrix[3][2];
+      float nearEstimate = -0.5 * b / a;
+      
+      if (start.z < 0.0 && end.z >= 0.0) {
+        float alpha = (nearEstimate - start.z) / (end.z - start.z);
+        end.xyz = mix(start.xyz, end.xyz, alpha);
+      } else if (end.z < 0.0 && start.z >= 0.0) {
+        float alpha = (nearEstimate - end.z) / (start.z - end.z);
+        start.xyz = mix(end.xyz, start.xyz, alpha);
+      }
+    }
+
+    vec4 clipStart = projectionMatrix * start;
+    vec4 clipEnd = projectionMatrix * end;
+
+    vec3 ndcStart = clipStart.xyz / clipStart.w;
+    vec3 ndcEnd = clipEnd.xyz / clipEnd.w;
+
+    vec2 dir = ndcEnd.xy - ndcStart.xy;
+    dir.x *= aspect;
+    dir = normalize(dir);
+
+    vec2 offset = vec2(dir.y, -dir.x);
+    dir.x /= aspect;
+    offset.x /= aspect;
+
+    if (position.x < 0.0) offset *= -1.0;
+
+    // Add endcap offsets
+    if (position.y < 0.0) {
+      offset += -dir;
+    } else if (position.y > 1.0) {
+      offset += dir;
+    }
+
+    // Line width multiplier (using resolution)
+    offset *= linewidth;
+    offset /= resolution.y;
+
+    vec4 clip = (position.y < 0.5) ? clipStart : clipEnd;
+    offset *= clip.w;
+    clip.xy += offset;
+
+    gl_Position = clip;
   }
 `;
 
@@ -374,12 +505,21 @@ const lineFragmentShader = `
   uniform float uLinkOpacity;
   uniform int uLinkColorMode; // 0: match-particles, 1: tint, 2: depth-gradient
   uniform vec3 uLinkTintColor;
+  uniform float uLinkGlow; // HDR glow multiplier driving UnrealBloomPass
 
   varying vec3 vColor;
   varying float vZPosition;
   varying vec3 vNormal;
+  varying vec2 vUv;
 
   void main() {
+    // Discard pixels in the rounded endcaps
+    if (abs(vUv.y) > 1.0) {
+      float a = vUv.x;
+      float b = (vUv.y > 0.0) ? vUv.y - 1.0 : vUv.y + 1.0;
+      if (a * a + b * b > 1.0) discard;
+    }
+
     // Drop pixels below the brightness threshold
     float luminance = dot(vColor, vec3(0.299, 0.587, 0.114));
     if (luminance < uAlphaThreshold) {
@@ -461,7 +601,8 @@ const lineFragmentShader = `
       gradedColor = mix(gradedColor, tintedColor, uTintMix);
     }
 
-    gl_FragColor = vec4(clamp(gradedColor, 0.0, 1.0), clamp(uLinkOpacity, 0.0, 1.0));
+    // Output with HDR Link Glow multiplier to boost bloom bloom pass intensity
+    gl_FragColor = vec4(gradedColor * uLinkGlow, clamp(uLinkOpacity, 0.0, 1.0));
   }
 `;
 
@@ -482,13 +623,60 @@ function init() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
+  // Post-Processing (Premium Bloom)
+  const renderScene = new RenderPass(scene, camera);
+  bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+  bloomPass.threshold = 0.0;
+  bloomPass.strength = 0.5; // Default strength
+  bloomPass.radius = 0.5;
+  
+  composer = new EffectComposer(renderer);
+  composer.addPass(renderScene);
+  composer.addPass(bloomPass);
+
   // Controls
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.05;
   controls.maxDistance = 2000;
   controls.minDistance = 10;
-  controls.addEventListener('start', () => { isAnimatingCam = false; });
+  controls.addEventListener('start', () => { 
+    isAnimatingCam = false; 
+    if (controls) controls.enableZoom = true;
+    if (window.cinematicTl) {
+      window.cinematicTl.kill();
+      window.cinematicTl = null;
+    }
+    if (window.customTimelineTl) {
+      window.customTimelineTl.kill();
+      window.customTimelineTl = null;
+      window.customTimelinePlaying = false;
+      
+      const playBtn = document.getElementById('btn-play-timeline');
+      if (playBtn) {
+        playBtn.innerHTML = `
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Play Path
+        `;
+        playBtn.classList.remove('btn-active');
+      }
+    }
+    gsap.killTweensOf(camera.position);
+    gsap.killTweensOf(controls.target);
+  });
+
+  // Handle FOV Zoom during active tweens to prevent breaking them
+  renderer.domElement.addEventListener('wheel', (e) => {
+    if (window.cinematicTl || window.customTimelinePlaying || isAnimatingCam) {
+      e.preventDefault();
+      e.stopPropagation();
+      const zoomSpeed = 0.03;
+      let newFov = camera.fov + e.deltaY * zoomSpeed;
+      newFov = Math.max(10, Math.min(120, newFov));
+      camera.fov = newFov;
+      camera.updateProjectionMatrix();
+    }
+  }, { passive: false });
 
   // Window Resize
   window.addEventListener('resize', onWindowResize);
@@ -509,16 +697,86 @@ function resetCamera() {
     targetCamPos.set(0, 0, 320);
     targetCamLook.set(0, 0, 0);
     isAnimatingCam = true;
+    if (controls) controls.enableZoom = false;
+    gsap.to(camera.position, { x: 0, y: 0, z: 320, duration: 2, ease: "power3.inOut" });
+    gsap.to(camera, { fov: 60, duration: 2, ease: "power3.inOut", onUpdate: () => camera.updateProjectionMatrix() });
+    if (controls) {
+      gsap.to(controls.target, { 
+        x: 0, 
+        y: 0, 
+        z: 0, 
+        duration: 2, 
+        ease: "power3.inOut", 
+        onComplete: () => {
+          isAnimatingCam = false;
+          controls.enableZoom = true;
+        } 
+      });
+    } else {
+      isAnimatingCam = false;
+    }
   }
 }
 
 function setCameraPreset(preset) {
-  if (camera) {
-    if (preset === 'reset') targetCamPos.set(0, 0, 320);
-    if (preset === 'iso') targetCamPos.set(250, 150, 250);
-    if (preset === 'side') targetCamPos.set(350, 0, 0);
-    targetCamLook.set(0, 0, 0);
-    isAnimatingCam = true;
+  if (!camera) return;
+
+  if (window.cinematicTl) {
+    window.cinematicTl.kill();
+    window.cinematicTl = null;
+  }
+  
+  // Also stop custom timeline if it is running
+  stopTimeline();
+
+  isAnimatingCam = true;
+  if (controls) controls.enableZoom = false;
+
+  if (preset === 'cinematic') {
+    window.cinematicTl = gsap.timeline({ repeat: -1, yoyo: true });
+    
+    // Slow cinematic sweeping motion
+    window.cinematicTl.to(camera.position, { x: 250, y: 100, z: 250, duration: 6, ease: "sine.inOut" }, 0);
+    if (controls) window.cinematicTl.to(controls.target, { x: 0, y: 0, z: 0, duration: 6, ease: "sine.inOut" }, 0);
+    
+    window.cinematicTl.to(camera.position, { x: -50, y: 300, z: 50, duration: 8, ease: "power1.inOut" }, 6);
+    
+    window.cinematicTl.to(camera.position, { x: -200, y: 20, z: -150, duration: 8, ease: "sine.inOut" }, 14);
+    
+    window.cinematicTl.to(camera.position, { x: 0, y: 0, z: 120, duration: 7, ease: "power2.inOut" }, 22);
+    
+    // Smoothly restore FOV if it was zoomed
+    gsap.to(camera, { fov: 60, duration: 3, ease: "sine.inOut", onUpdate: () => camera.updateProjectionMatrix() });
+    
+    return;
+  }
+
+  let px = 0, py = 0, pz = 320;
+  if (preset === 'reset') { px = 0; py = 0; pz = 320; }
+  else if (preset === 'iso') { px = 250; py = 150; pz = 250; }
+  else if (preset === 'side') { px = 350; py = 0; pz = 0; }
+  else if (preset === 'top') { px = 0; py = 350; pz = 0; }
+  else if (preset === 'macro') { px = 0; py = 0; pz = 60; }
+  
+  targetCamPos.set(px, py, pz);
+  targetCamLook.set(0, 0, 0);
+  
+  gsap.to(camera.position, { x: px, y: py, z: pz, duration: 2.5, ease: "power3.inOut" });
+  gsap.to(camera, { fov: 60, duration: 2.5, ease: "power3.inOut", onUpdate: () => camera.updateProjectionMatrix() });
+  if (controls) {
+    gsap.to(controls.target, { 
+      x: 0, 
+      y: 0, 
+      z: 0, 
+      duration: 2.5, 
+      ease: "power3.inOut", 
+      onComplete: () => {
+        isAnimatingCam = false;
+        controls.enableZoom = true;
+      }
+    });
+  } else {
+    isAnimatingCam = false;
   }
 }
 
@@ -527,6 +785,10 @@ function onWindowResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
+  if (shaderUniforms.resolution) {
+    shaderUniforms.resolution.value.set(window.innerWidth, window.innerHeight);
+  }
 }
 
 // --- Image Loaders & Parsers ---
@@ -865,11 +1127,32 @@ function buildLines() {
 
   if (linePositions.length === 0) return;
 
-  const lineGeometry = new THREE.BufferGeometry();
-  lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
-  lineGeometry.setAttribute('originalColor', new THREE.Float32BufferAttribute(lineColors, 3));
-  lineGeometry.setAttribute('pixelVal', new THREE.Float32BufferAttribute(linePixelVals, 1));
-  lineGeometry.setAttribute('depthGradient', new THREE.Float32BufferAttribute(lineDepthGradients, 2));
+  const lineGeometry = new LineSegmentsGeometry();
+  lineGeometry.setPositions(linePositions);
+  lineGeometry.setColors(lineColors);
+
+  const instanceCount = linePositions.length / 6;
+
+  const pixelValStartArr = new Float32Array(instanceCount);
+  const pixelValEndArr = new Float32Array(instanceCount);
+  const depthGradientStartArr = new Float32Array(instanceCount * 2);
+  const depthGradientEndArr = new Float32Array(instanceCount * 2);
+
+  for (let i = 0; i < instanceCount; i++) {
+    pixelValStartArr[i] = linePixelVals[i * 2];
+    pixelValEndArr[i] = linePixelVals[i * 2 + 1];
+    
+    depthGradientStartArr[i * 2] = lineDepthGradients[i * 4];
+    depthGradientStartArr[i * 2 + 1] = lineDepthGradients[i * 4 + 1];
+    
+    depthGradientEndArr[i * 2] = lineDepthGradients[i * 4 + 2];
+    depthGradientEndArr[i * 2 + 1] = lineDepthGradients[i * 4 + 3];
+  }
+
+  lineGeometry.setAttribute('pixelValStart', new THREE.InstancedBufferAttribute(pixelValStartArr, 1));
+  lineGeometry.setAttribute('pixelValEnd', new THREE.InstancedBufferAttribute(pixelValEndArr, 1));
+  lineGeometry.setAttribute('depthGradientStart', new THREE.InstancedBufferAttribute(depthGradientStartArr, 2));
+  lineGeometry.setAttribute('depthGradientEnd', new THREE.InstancedBufferAttribute(depthGradientEndArr, 2));
 
   const lineMaterial = new THREE.ShaderMaterial({
     vertexShader: lineVertexShader,
@@ -881,7 +1164,7 @@ function buildLines() {
     blending: THREE.AdditiveBlending // Additive blending for glowing mesh appearance
   });
 
-  lineSystem = new THREE.LineSegments(lineGeometry, lineMaterial);
+  lineSystem = new THREE.Mesh(lineGeometry, lineMaterial);
   scene.add(lineSystem);
 }
 
@@ -909,13 +1192,7 @@ function animate(time) {
   const dt = time * 0.001; // absolute time in seconds
   shaderUniforms.uTime.value = dt;
 
-  if (isAnimatingCam) {
-    camera.position.lerp(targetCamPos, 0.04);
-    controls.target.lerp(targetCamLook, 0.04);
-    if (camera.position.distanceTo(targetCamPos) < 1.0) {
-      isAnimatingCam = false;
-    }
-  } else if (driftAmp > 0) {
+  if (!isAnimatingCam && driftAmp > 0) {
     const t = dt * driftSpeed;
     const dx = Math.sin(t) * driftAmp;
     const dy = Math.cos(t * 0.8) * driftAmp;
@@ -928,7 +1205,12 @@ function animate(time) {
     controls.autoRotateSpeed = driftSpeed * 2.0;
     controls.update();
   }
-  if (renderer && scene && camera) renderer.render(scene, camera);
+  
+  if (composer && scene && camera) {
+    composer.render();
+  } else if (renderer && scene && camera) {
+    renderer.render(scene, camera);
+  }
 
   updateHUD(time);
 }
@@ -1201,17 +1483,67 @@ function exportJSON() {
 
 // Export High-Res PNG
 function exportPNG() {
-  if (!renderer) return;
+  if (!renderer || !camera) return;
   
-  // Render immediately to ensure current buffer state is captured
-  renderer.render(scene, camera);
+  // Save current sizes
+  const width = window.innerWidth;
+  const height = window.innerHeight;
   
+  // Set super-high resolution (e.g. 4K width: 3840, aspect ratio preserved)
+  const exportWidth = 3840;
+  const exportHeight = Math.round(exportWidth / (width / height));
+  
+  // 1. Temporarily resize renderer and composer (updateStyle = false, so canvas styling stays 100% on screen)
+  renderer.setSize(exportWidth, exportHeight, false);
+  if (composer) {
+    composer.setSize(exportWidth, exportHeight);
+  }
+  
+  // Update camera aspect and projection
+  camera.aspect = exportWidth / exportHeight;
+  camera.updateProjectionMatrix();
+  
+  // Update resolution uniform so shader line expansion matches the high-resolution buffer size
+  if (shaderUniforms.resolution) {
+    shaderUniforms.resolution.value.set(exportWidth, exportHeight);
+  }
+  
+  // 2. Render the high-resolution frame
+  if (composer) {
+    composer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
+  
+  // 3. Capture the image data URL
   const dataURL = renderer.domElement.toDataURL('image/png');
+  
+  // 4. Download it
   const a = document.createElement('a');
   const name = currentImage.name.split('.')[0];
   a.href = dataURL;
-  a.download = `${name}_render.png`;
+  a.download = `${name}_render_4k.png`;
   a.click();
+  
+  // 5. Restore the original sizes
+  renderer.setSize(width, height);
+  if (composer) {
+    composer.setSize(width, height);
+  }
+  
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  
+  if (shaderUniforms.resolution) {
+    shaderUniforms.resolution.value.set(width, height);
+  }
+  
+  // Re-render so the screen updates correctly
+  if (composer) {
+    composer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
 }
 
 // --- Light Vector Calculator helper ---
@@ -1344,6 +1676,15 @@ function initUniformsFromDOM() {
   shaderUniforms.uAlphaThreshold.value = parseFloat(document.getElementById('alpha-threshold').value);
   shaderUniforms.uSizeAttenuation.value = document.getElementById('size-attenuation').checked;
   shaderUniforms.uPointShape.value = parseInt(document.getElementById('point-shape').value);
+  
+  shaderUniforms.uOrganicFieldStrength.value = parseFloat(document.getElementById('organic-field-strength').value);
+  shaderUniforms.uOrganicFieldSpeed.value = parseFloat(document.getElementById('organic-field-speed').value);
+  shaderUniforms.uEnableFloating.value = document.getElementById('enable-organic-float').checked;
+  
+  if (bloomPass) {
+    bloomPass.strength = parseFloat(document.getElementById('bloom-strength').value);
+    bloomPass.radius = parseFloat(document.getElementById('bloom-radius').value);
+  }
 
   // Mode mapping
   const modeVal = document.getElementById('color-mode').value;
@@ -1358,6 +1699,8 @@ function initUniformsFromDOM() {
   // Link Uniforms mapping
   shaderUniforms.uLinkOpacity.value = parseFloat(document.getElementById('link-opacity').value);
   shaderUniforms.uLinkTintColor.value.set(document.getElementById('link-tint-color').value);
+  shaderUniforms.linewidth.value = parseFloat(document.getElementById('link-thickness').value);
+  shaderUniforms.uLinkGlow.value = parseFloat(document.getElementById('link-glow').value);
 
   const linkColorModeVal = document.getElementById('link-color-mode').value;
   let linkColorMode = 0;
@@ -1397,7 +1740,14 @@ function initUniformsFromDOM() {
     { id: 'drift-amp', unit: '' },
     { id: 'drift-speed', unit: 'x' },
     { id: 'link-opacity', unit: '' },
-    { id: 'link-max-dist', unit: '' }
+    { id: 'link-max-dist', unit: '' },
+    { id: 'link-thickness', unit: 'px' },
+    { id: 'link-glow', unit: '' },
+    { id: 'organic-field-strength', unit: '' },
+    { id: 'organic-field-speed', unit: '' },
+    { id: 'bloom-strength', unit: '' },
+    { id: 'bloom-radius', unit: '' },
+    { id: 'timeline-speed', unit: 's' }
   ];
 
   displays.forEach(d => {
@@ -1421,6 +1771,582 @@ function initUniformsFromDOM() {
   const linkTintWrapper = document.getElementById('link-tint-picker-wrapper');
   if (linkTintWrapper) {
     linkTintWrapper.style.display = linkColorMode === 1 ? 'flex' : 'none';
+  }
+}
+
+// --- Video Recording & Timeline Capture ---
+function startRecording() {
+  if (!renderer || !camera) return;
+  
+  // 1. Calculate resolution matching the screen's logical canvas dimensions
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  
+  // Enforce even dimensions to satisfy encoder restrictions
+  let recordWidth = width;
+  let recordHeight = height;
+  if (recordWidth % 2 !== 0) recordWidth -= 1;
+  if (recordHeight % 2 !== 0) recordHeight -= 1;
+  
+  renderer.setSize(recordWidth, recordHeight, false);
+  if (composer) {
+    composer.setSize(recordWidth, recordHeight);
+  }
+  
+  camera.aspect = recordWidth / recordHeight;
+  camera.updateProjectionMatrix();
+  
+  if (shaderUniforms.resolution) {
+    shaderUniforms.resolution.value.set(recordWidth, recordHeight);
+  }
+
+  const canvas = renderer.domElement;
+  
+  // Capture stream at 60 FPS
+  const stream = canvas.captureStream(60);
+  
+  // Detect best supported mimeType and extension, prioritizing MP4
+  let mimeType = 'video/webm';
+  let fileExt = 'webm';
+  
+  const mimeTypes = [
+    'video/mp4;codecs=h264',
+    'video/mp4;codecs=avc1',
+    'video/mp4',
+    'video/webm;codecs=h264',
+    'video/webm;codecs=vp9',
+    'video/webm'
+  ];
+  
+  for (const type of mimeTypes) {
+    if (MediaRecorder.isTypeSupported(type)) {
+      mimeType = type;
+      if (type.includes('mp4')) {
+        fileExt = 'mp4';
+      }
+      break;
+    }
+  }
+  
+  console.log(`Starting recording with mimeType: ${mimeType}, fileExt: ${fileExt}`);
+  
+  recordedChunks = [];
+  
+  const options = {
+    mimeType: mimeType,
+    videoBitsPerSecond: 30000000 // 30 Mbps for super premium quality high-res video
+  };
+  
+  try {
+    mediaRecorder = new MediaRecorder(stream, options);
+  } catch (err) {
+    console.warn("Failed to create MediaRecorder with options, falling back to basic stream configuration", err);
+    try {
+      mediaRecorder = new MediaRecorder(stream);
+    } catch (err2) {
+      alert("MediaRecorder is not supported in this browser: " + err2.message);
+      
+      // Restore sizes if failed
+      renderer.setSize(width, height);
+      if (composer) composer.setSize(width, height);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      if (shaderUniforms.resolution) shaderUniforms.resolution.value.set(width, height);
+      return;
+    }
+  }
+  
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) {
+      recordedChunks.push(e.data);
+    }
+  };
+  
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    
+    let baseName = 'ppparticles';
+    if (currentImage && currentImage.name) {
+      baseName = currentImage.name.replace(/\.[^/.]+$/, "");
+    }
+    
+    a.href = url;
+    a.download = `${baseName}_recording.${fileExt}`;
+    a.click();
+    
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 100);
+    
+    recordedChunks = [];
+    isRecording = false;
+    
+    // Restore sizes on stop
+    const currentW = window.innerWidth;
+    const currentH = window.innerHeight;
+    renderer.setSize(currentW, currentH);
+    if (composer) {
+      composer.setSize(currentW, currentH);
+    }
+    camera.aspect = currentW / currentH;
+    camera.updateProjectionMatrix();
+    if (shaderUniforms.resolution) {
+      shaderUniforms.resolution.value.set(currentW, currentH);
+    }
+    
+    const recordBtn = document.getElementById('btn-record-video');
+    if (recordBtn) {
+      recordBtn.innerHTML = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6"/></svg>
+        Record Video (MP4/WebM)
+      `;
+      recordBtn.classList.remove('btn-recording');
+      recordBtn.classList.add('btn-primary');
+    }
+  };
+  
+  mediaRecorder.start(100); // chunk data every 100ms
+  isRecording = true;
+  
+  const recordBtn = document.getElementById('btn-record-video');
+  if (recordBtn) {
+    recordBtn.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pulse-icon"><circle cx="12" cy="12" r="10" fill="#ef4444"/></svg>
+      Stop Recording
+    `;
+    recordBtn.classList.add('btn-recording');
+    recordBtn.classList.remove('btn-primary');
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+}
+
+function addKeyframe() {
+  if (!camera || !controls) return;
+  
+  // Save sliders
+  const params = {};
+  const sliderIds = [
+    'res-step', 'point-size', 'model-scale', 'depth-scale', 
+    'scatter-amp', 'scatter-freq', 'scatter-speed', 
+    'point-opacity', 'alpha-threshold', 
+    'exposure', 'contrast', 'saturation', 'tint-mix', 
+    'light-angle', 'drift-amp', 'drift-speed', 
+    'organic-field-strength', 'organic-field-speed', 
+    'bloom-strength', 'bloom-radius',
+    'link-opacity', 'link-max-dist', 'link-thickness', 'link-glow',
+    'timeline-speed'
+  ];
+  sliderIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      params[id] = parseFloat(el.value);
+    }
+  });
+  
+  // Save checkboxes
+  const checkboxIds = [
+    'enable-links', 'size-attenuation', 'enable-auto-orbit', 
+    'enable-shading', 'enable-organic-float', 'enable-split-toning'
+  ];
+  checkboxIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      params[id] = el.checked;
+    }
+  });
+
+  // Save dropdowns
+  const selectIds = ['depth-source', 'color-mode', 'point-shape', 'link-color-mode'];
+  selectIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      params[id] = el.value;
+    }
+  });
+
+  // Save color pickers
+  const colorIds = ['monochrome-color', 'shadow-tint', 'highlight-tint', 'link-tint-color'];
+  colorIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      params[id] = el.value;
+    }
+  });
+
+  customKeyframes.push({
+    px: camera.position.x,
+    py: camera.position.y,
+    pz: camera.position.z,
+    tx: controls.target.x,
+    ty: controls.target.y,
+    tz: controls.target.z,
+    fov: camera.fov,
+    params: params
+  });
+  
+  const hud = document.getElementById('timeline-hud');
+  if (hud) {
+    hud.innerText = `${customKeyframes.length} Keyframe${customKeyframes.length !== 1 ? 's' : ''} Captured`;
+  }
+}
+
+function applyKeyframeParameters(kf) {
+  if (!kf || !kf.params) return;
+
+  // 1. Apply checkboxes (instant flags) directly to uniforms and state variables
+  const enableLinksVal = kf.params['enable-links'];
+  const enableLinksEl = document.getElementById('enable-links');
+  if (enableLinksEl && enableLinksVal !== undefined) {
+    enableLinksEl.checked = enableLinksVal;
+    if (lineSystem) {
+      lineSystem.visible = enableLinksVal;
+    } else if (enableLinksVal) {
+      buildLines();
+    }
+  }
+
+  const sizeAttVal = kf.params['size-attenuation'];
+  const sizeAttEl = document.getElementById('size-attenuation');
+  if (sizeAttEl && sizeAttVal !== undefined) {
+    sizeAttEl.checked = sizeAttVal;
+    shaderUniforms.uSizeAttenuation.value = sizeAttVal;
+  }
+
+  const autoOrbitVal = kf.params['enable-auto-orbit'];
+  const autoOrbitEl = document.getElementById('enable-auto-orbit');
+  if (autoOrbitEl && autoOrbitVal !== undefined) {
+    autoOrbitEl.checked = autoOrbitVal;
+    enableAutoOrbit = autoOrbitVal;
+  }
+
+  const shadingVal = kf.params['enable-shading'];
+  const shadingEl = document.getElementById('enable-shading');
+  if (shadingEl && shadingVal !== undefined) {
+    shadingEl.checked = shadingVal;
+    shaderUniforms.uEnableShading.value = shadingVal;
+  }
+
+  const organicFloatVal = kf.params['enable-organic-float'];
+  const organicFloatEl = document.getElementById('enable-organic-float');
+  if (organicFloatEl && organicFloatVal !== undefined) {
+    organicFloatEl.checked = organicFloatVal;
+    shaderUniforms.uEnableFloating.value = organicFloatVal;
+  }
+
+  const splitToningVal = kf.params['enable-split-toning'];
+  const splitToningEl = document.getElementById('enable-split-toning');
+  if (splitToningEl && splitToningVal !== undefined) {
+    splitToningEl.checked = splitToningVal;
+    shaderUniforms.uEnableSplitToning.value = splitToningVal;
+    const splitToningOptions = document.getElementById('split-toning-options');
+    if (splitToningOptions) {
+      splitToningOptions.style.display = splitToningVal ? 'block' : 'none';
+    }
+  }
+
+  // 2. Apply dropdown selects directly
+  const depthSourceVal = kf.params['depth-source'];
+  const depthSourceEl = document.getElementById('depth-source');
+  if (depthSourceEl && depthSourceVal !== undefined) {
+    const currentVal = depthSourceEl.value;
+    if (currentVal !== depthSourceVal) {
+      depthSourceEl.value = depthSourceVal;
+      buildParticles();
+    }
+  }
+
+  const colorModeVal = kf.params['color-mode'];
+  const colorModeEl = document.getElementById('color-mode');
+  if (colorModeEl && colorModeVal !== undefined) {
+    colorModeEl.value = colorModeVal;
+    let mode = 0;
+    if (colorModeVal === 'original') mode = 0;
+    else if (colorModeVal === 'greyscale') mode = 1;
+    else if (colorModeVal === 'depth-gradient') mode = 2;
+    else if (colorModeVal === 'monochrome') mode = 3;
+    shaderUniforms.uColorMode.value = mode;
+    const tintWrapper = document.getElementById('monochrome-picker-wrapper');
+    if (tintWrapper) tintWrapper.style.display = mode === 3 ? 'flex' : 'none';
+  }
+
+  const pointShapeVal = kf.params['point-shape'];
+  const pointShapeEl = document.getElementById('point-shape');
+  if (pointShapeEl && pointShapeVal !== undefined) {
+    pointShapeEl.value = pointShapeVal;
+    shaderUniforms.uPointShape.value = parseInt(pointShapeVal);
+  }
+
+  const linkColorModeVal = kf.params['link-color-mode'];
+  const linkColorModeEl = document.getElementById('link-color-mode');
+  if (linkColorModeEl && linkColorModeVal !== undefined) {
+    linkColorModeEl.value = linkColorModeVal;
+    let mode = 0;
+    if (linkColorModeVal === 'match-particles') mode = 0;
+    else if (linkColorModeVal === 'tint') mode = 1;
+    else if (linkColorModeVal === 'depth-gradient') mode = 2;
+    shaderUniforms.uLinkColorMode.value = mode;
+    const linkTintWrapper = document.getElementById('link-tint-picker-wrapper');
+    if (linkTintWrapper) linkTintWrapper.style.display = mode === 1 ? 'flex' : 'none';
+  }
+
+  // 3. Apply color pickers directly
+  const monochromeColorVal = kf.params['monochrome-color'];
+  const monochromeColorEl = document.getElementById('monochrome-color');
+  if (monochromeColorEl && monochromeColorVal !== undefined) {
+    monochromeColorEl.value = monochromeColorVal;
+    shaderUniforms.uTintColor.value.set(monochromeColorVal);
+  }
+
+  const shadowTintVal = kf.params['shadow-tint'];
+  const shadowTintEl = document.getElementById('shadow-tint');
+  if (shadowTintEl && shadowTintVal !== undefined) {
+    shadowTintEl.value = shadowTintVal;
+    shaderUniforms.uShadowTint.value.set(shadowTintVal);
+  }
+
+  const highlightTintVal = kf.params['highlight-tint'];
+  const highlightTintEl = document.getElementById('highlight-tint');
+  if (highlightTintEl && highlightTintVal !== undefined) {
+    highlightTintEl.value = highlightTintVal;
+    shaderUniforms.uHighlightTint.value.set(highlightTintVal);
+  }
+
+  const linkTintColorVal = kf.params['link-tint-color'];
+  const linkTintColorEl = document.getElementById('link-tint-color');
+  if (linkTintColorEl && linkTintColorVal !== undefined) {
+    linkTintColorEl.value = linkTintColorVal;
+    shaderUniforms.uLinkTintColor.value.set(linkTintColorVal);
+  }
+
+  // 4. Apply non-tweened grid resolution (res-step)
+  const resStep = document.getElementById('res-step');
+  if (resStep && kf.params['res-step'] !== undefined) {
+    const currentVal = parseFloat(resStep.value);
+    const targetVal = kf.params['res-step'];
+    if (currentVal !== targetVal) {
+      resStep.value = targetVal;
+      const disp = document.getElementById('res-step-val');
+      if (disp) disp.innerText = `${targetVal}px`;
+      buildParticles();
+    }
+  }
+
+  // 5. Apply non-tweened link distance (link-max-dist)
+  const linkMaxDist = document.getElementById('link-max-dist');
+  if (linkMaxDist && kf.params['link-max-dist'] !== undefined) {
+    const currentVal = parseFloat(linkMaxDist.value);
+    const targetVal = kf.params['link-max-dist'];
+    if (currentVal !== targetVal) {
+      linkMaxDist.value = targetVal;
+      const disp = document.getElementById('link-max-dist-val');
+      if (disp) disp.innerText = `${targetVal}`;
+      buildLines();
+    }
+  }
+}
+
+function stopTimeline() {
+  if (window.customTimelineTl) {
+    window.customTimelineTl.kill();
+    window.customTimelineTl = null;
+  }
+  window.customTimelinePlaying = false;
+  if (controls) controls.enableZoom = true;
+  
+  const playBtn = document.getElementById('btn-play-timeline');
+  if (playBtn) {
+    playBtn.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Play Path
+    `;
+    playBtn.classList.remove('btn-active');
+  }
+}
+
+function clearTimeline() {
+  customKeyframes = [];
+  stopTimeline();
+  const hud = document.getElementById('timeline-hud');
+  if (hud) {
+    hud.innerText = '0 Keyframes Captured';
+  }
+}
+
+function playTimeline() {
+  if (customKeyframes.length < 2) {
+    alert('Add at least 2 keyframes to play a path.');
+    return;
+  }
+  
+  stopTimeline(); // Stop any existing play first
+  
+  const speed = parseFloat(document.getElementById('timeline-speed').value) || 4.0;
+  
+  if (controls) controls.enableZoom = false;
+  window.customTimelinePlaying = true;
+  
+  const playBtn = document.getElementById('btn-play-timeline');
+  if (playBtn) {
+    playBtn.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16"/></svg>
+      Stop Path
+    `;
+    playBtn.classList.add('btn-active');
+  }
+  
+  // 1. Jump camera immediately to the starting keyframe position & fov
+  const kfStart = customKeyframes[0];
+  camera.position.set(kfStart.px, kfStart.py, kfStart.pz);
+  if (controls) controls.target.set(kfStart.tx, kfStart.ty, kfStart.tz);
+  camera.fov = kfStart.fov;
+  camera.updateProjectionMatrix();
+  
+  // Apply keyframe 0 parameter state immediately
+  applyKeyframeParameters(kfStart);
+
+  // Define the set of sliders we want to tween smoothly
+  const tweenableSliderIds = [
+    'point-size', 'model-scale', 'depth-scale', 
+    'scatter-amp', 'scatter-freq', 'scatter-speed', 
+    'point-opacity', 'alpha-threshold', 
+    'exposure', 'contrast', 'saturation', 'tint-mix', 
+    'light-angle', 'drift-amp', 'drift-speed', 
+    'organic-field-strength', 'organic-field-speed', 
+    'bloom-strength', 'bloom-radius',
+    'link-opacity', 'link-thickness', 'link-glow'
+  ];
+
+  // Pre-cache DOM elements, callback functions, and units for the tween updates
+  const cachedSliders = tweenableSliderIds.map(id => {
+    const input = document.getElementById(id);
+    const display = document.getElementById(`${id}-val`);
+    const sliderInfo = sliders.find(s => s.id === id);
+    return {
+      id,
+      input,
+      display,
+      callback: sliderInfo ? sliderInfo.callback : null,
+      unit: sliderInfo ? sliderInfo.unit : ''
+    };
+  });
+
+  // 2. Setup initial tweenState using keyframe 0 parameters
+  const tweenState = {};
+  cachedSliders.forEach(item => {
+    tweenState[item.id] = kfStart.params[item.id] !== undefined ? kfStart.params[item.id] : (item.input ? parseFloat(item.input.value) : 0);
+  });
+
+  window.customTimelineTl = gsap.timeline({
+    onComplete: () => {
+      stopTimeline();
+    }
+  });
+  
+  // 3. Add camera & parameter tweens for each segment in sequence
+  for (let i = 1; i < customKeyframes.length; i++) {
+    const kfPrev = customKeyframes[i - 1];
+    const kfTarget = customKeyframes[i];
+    const startTime = (i - 1) * speed;
+    
+    // Camera position & target tween
+    window.customTimelineTl.to(camera.position, {
+      x: kfTarget.px,
+      y: kfTarget.py,
+      z: kfTarget.pz,
+      duration: speed,
+      ease: 'power2.inOut'
+    }, startTime);
+    
+    if (controls) {
+      window.customTimelineTl.to(controls.target, {
+        x: kfTarget.tx,
+        y: kfTarget.ty,
+        z: kfTarget.tz,
+        duration: speed,
+        ease: 'power2.inOut'
+      }, startTime);
+    }
+    
+    // FOV tween
+    window.customTimelineTl.to(camera, {
+      fov: kfTarget.fov,
+      duration: speed,
+      ease: 'power2.inOut',
+      onUpdate: () => camera.updateProjectionMatrix()
+    }, startTime);
+
+    // Build targets object for sliders
+    const targetParams = {};
+    cachedSliders.forEach(item => {
+      targetParams[item.id] = kfTarget.params[item.id] !== undefined ? kfTarget.params[item.id] : (item.input ? parseFloat(item.input.value) : 0);
+    });
+
+    let frameCounter = 0;
+
+    // Parameter tween (smooth morphing)
+    window.customTimelineTl.to(tweenState, {
+      ...targetParams,
+      duration: speed,
+      ease: 'power2.inOut',
+      onStart: () => {
+        // Apply instant checkboxes/flags/res-step of the start keyframe of this segment
+        applyKeyframeParameters(customKeyframes[i - 1]);
+      },
+      onUpdate: () => {
+        const updateDOM = (frameCounter++ % 3 === 0);
+        // Update DOM sliders, text displays, and execute uniforms callbacks
+        for (let j = 0; j < cachedSliders.length; j++) {
+          const item = cachedSliders[j];
+          const val = tweenState[item.id];
+          
+          if (item.callback) {
+            item.callback(val);
+          }
+          
+          if (updateDOM && item.input) {
+            const currentVal = parseFloat(item.input.value);
+            if (Math.abs(currentVal - val) > 0.0001) {
+              item.input.value = val;
+              
+              if (item.display) {
+                if (item.id === 'model-scale' || item.id === 'drift-amp' || item.id === 'light-angle') {
+                  item.display.innerText = `${Math.round(val)}${item.unit}`;
+                } else {
+                  item.display.innerText = `${val.toFixed(2)}${item.unit}`;
+                }
+              }
+            }
+          }
+        }
+      },
+      onComplete: () => {
+        // Securely apply target keyframe parameter boundaries
+        applyKeyframeParameters(kfTarget);
+        
+        // Force sync final DOM slider states at the end of the segment
+        for (let j = 0; j < cachedSliders.length; j++) {
+          const item = cachedSliders[j];
+          const val = tweenState[item.id];
+          if (item.input) {
+            item.input.value = val;
+            if (item.display) {
+              if (item.id === 'model-scale' || item.id === 'drift-amp' || item.id === 'light-angle') {
+                item.display.innerText = `${Math.round(val)}${item.unit}`;
+              } else {
+                item.display.innerText = `${val.toFixed(2)}${item.unit}`;
+              }
+            }
+          }
+        }
+      }
+    }, startTime);
   }
 }
 
@@ -1453,7 +2379,7 @@ function setupEventListeners() {
   });
 
   // Slider change handlers with visual displays updates
-  const sliders = [
+  sliders = [
     { id: 'res-step', unit: 'px', callback: buildParticles },
     { id: 'point-size', unit: '', callback: (v) => { shaderUniforms.uPointSize.value = v; } },
     { id: 'model-scale', unit: '', callback: (v) => { shaderUniforms.uModelScale.value = v; } },
@@ -1469,18 +2395,85 @@ function setupEventListeners() {
     { id: 'tint-mix', unit: '', callback: (v) => { shaderUniforms.uTintMix.value = v; } },
     { id: 'light-angle', unit: '°', callback: (v) => { updateLightDirection(v); } },
     { id: 'drift-amp', unit: '', callback: (v) => { driftAmp = v; } },
-    { id: 'drift-speed', unit: 'x', callback: (v) => { driftSpeed = v; } }
+    { id: 'drift-speed', unit: 'x', callback: (v) => { driftSpeed = v; } },
+    { id: 'organic-field-strength', unit: '', callback: (v) => { shaderUniforms.uOrganicFieldStrength.value = v; } },
+    { id: 'organic-field-speed', unit: '', callback: (v) => { shaderUniforms.uOrganicFieldSpeed.value = v; } },
+    { id: 'bloom-strength', unit: '', callback: (v) => { if (bloomPass) bloomPass.strength = v; } },
+    { id: 'bloom-radius', unit: '', callback: (v) => { if (bloomPass) bloomPass.radius = v; } },
+    { id: 'link-opacity', unit: '', callback: (v) => { shaderUniforms.uLinkOpacity.value = v; } },
+    { id: 'link-max-dist', unit: '', callback: (v) => { buildLines(); } },
+    { id: 'link-thickness', unit: 'px', callback: (v) => { shaderUniforms.linewidth.value = v; } },
+    { id: 'link-glow', unit: '', callback: (v) => { shaderUniforms.uLinkGlow.value = v; } },
+    { id: 'timeline-speed', unit: 's', callback: () => {} }
   ];
 
   sliders.forEach(slider => {
     const input = document.getElementById(slider.id);
     const display = document.getElementById(`${slider.id}-val`);
 
-    input.addEventListener('input', (e) => {
-      const val = parseFloat(e.target.value);
-      if (display) display.innerText = `${val}${slider.unit}`;
-      slider.callback(val);
-    });
+    if (input) {
+      input.addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value);
+        if (display) display.innerText = `${val}${slider.unit}`;
+        
+        // Fast update for uniforms only
+        if (slider.id !== 'res-step' && slider.id !== 'link-max-dist') {
+          slider.callback(val);
+        }
+      });
+
+      // Slow update for heavy calculations runs only when user releases mouse
+      if (slider.id === 'res-step' || slider.id === 'link-max-dist') {
+        input.addEventListener('change', (e) => {
+          const val = parseFloat(e.target.value);
+          slider.callback(val);
+        });
+      }
+    }
+
+    if (display && input) {
+      display.style.cursor = 'text';
+      display.title = 'Double click to edit manually';
+      display.addEventListener('dblclick', () => {
+        const currentVal = input.value;
+        const inputField = document.createElement('input');
+        inputField.type = 'number';
+        inputField.value = currentVal;
+        inputField.step = input.step || "0.01";
+        inputField.style.width = '60px';
+        inputField.style.background = 'rgba(0,0,0,0.5)';
+        inputField.style.color = '#fff';
+        inputField.style.border = '1px solid rgba(255,255,255,0.3)';
+        inputField.style.borderRadius = '4px';
+        inputField.style.padding = '2px';
+        inputField.style.fontFamily = 'inherit';
+        inputField.style.fontSize = 'inherit';
+        inputField.style.textAlign = 'right';
+        
+        display.innerHTML = '';
+        display.appendChild(inputField);
+        inputField.focus();
+
+        const finishEditing = () => {
+          let newVal = parseFloat(inputField.value);
+          if (isNaN(newVal)) newVal = parseFloat(input.value);
+          
+          if (input.min !== "") newVal = Math.max(parseFloat(input.min), newVal);
+          if (input.max !== "") newVal = Math.min(parseFloat(input.max), newVal);
+          
+          input.value = newVal;
+          display.innerText = `${newVal}${slider.unit}`;
+          slider.callback(newVal);
+        };
+
+        inputField.addEventListener('blur', finishEditing);
+        inputField.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            inputField.blur();
+          }
+        });
+      });
+    }
   });
 
   // Checkboxes
@@ -1498,6 +2491,13 @@ function setupEventListeners() {
   enableShading.addEventListener('change', (e) => {
     shaderUniforms.uEnableShading.value = e.target.checked;
   });
+
+  const enableOrganicFloat = document.getElementById('enable-organic-float');
+  if (enableOrganicFloat) {
+    enableOrganicFloat.addEventListener('change', (e) => {
+      shaderUniforms.uEnableFloating.value = e.target.checked;
+    });
+  }
 
   const enableSplitToning = document.getElementById('enable-split-toning');
   const splitToningOptions = document.getElementById('split-toning-options');
@@ -1553,6 +2553,13 @@ function setupEventListeners() {
   document.getElementById('btn-export-csv').addEventListener('click', exportCSV);
   document.getElementById('btn-export-json').addEventListener('click', exportJSON);
   document.getElementById('btn-export-png').addEventListener('click', exportPNG);
+  document.getElementById('btn-record-video')?.addEventListener('click', () => {
+    if (!isRecording) {
+      startRecording();
+    } else {
+      stopRecording();
+    }
+  });
 
   // Drag and Drop files
   const dropzone = document.getElementById('dropzone');
@@ -1591,6 +2598,20 @@ function setupEventListeners() {
   document.getElementById('cam-reset')?.addEventListener('click', () => setCameraPreset('reset'));
   document.getElementById('cam-iso')?.addEventListener('click', () => setCameraPreset('iso'));
   document.getElementById('cam-side')?.addEventListener('click', () => setCameraPreset('side'));
+  document.getElementById('cam-top')?.addEventListener('click', () => setCameraPreset('top'));
+  document.getElementById('cam-macro')?.addEventListener('click', () => setCameraPreset('macro'));
+  document.getElementById('cam-cinematic')?.addEventListener('click', () => setCameraPreset('cinematic'));
+
+  // Custom Timeline buttons
+  document.getElementById('btn-add-keyframe')?.addEventListener('click', addKeyframe);
+  document.getElementById('btn-clear-timeline')?.addEventListener('click', clearTimeline);
+  document.getElementById('btn-play-timeline')?.addEventListener('click', () => {
+    if (!window.customTimelinePlaying) {
+      playTimeline();
+    } else {
+      stopTimeline();
+    }
+  });
 
   // Global preset buttons
   document.querySelectorAll('.preset-btn').forEach(btn => {
@@ -1604,25 +2625,14 @@ function setupEventListeners() {
 initUniformsFromDOM();
 
 // --- Link UI listeners ---
-const linkOpacity = document.getElementById('link-opacity');
-linkOpacity?.addEventListener('input', (e) => {
-  const v = parseFloat(e.target.value);
-  shaderUniforms.uLinkOpacity.value = v;
-  const disp = document.getElementById('link-opacity-val');
-  if (disp) disp.innerText = v.toFixed(2);
-  buildLines();
-});
-
-const linkMaxDist = document.getElementById('link-max-dist');
-linkMaxDist?.addEventListener('input', (e) => {
-  const disp = document.getElementById('link-max-dist-val');
-  if (disp) disp.innerText = `${e.target.value}`;
-  buildLines();
-});
 
 const enableLinks = document.getElementById('enable-links');
 enableLinks?.addEventListener('change', (e) => {
-  buildLines();
+  if (lineSystem) {
+    lineSystem.visible = e.target.checked;
+  } else if (e.target.checked) {
+    buildLines();
+  }
 });
 
 const linkColorMode = document.getElementById('link-color-mode');
@@ -1635,13 +2645,11 @@ linkColorMode?.addEventListener('change', (e) => {
   shaderUniforms.uLinkColorMode.value = mode;
   const linkTintWrapper = document.getElementById('link-tint-picker-wrapper');
   if (linkTintWrapper) linkTintWrapper.style.display = mode === 1 ? 'flex' : 'none';
-  buildLines();
 });
 
 const linkTintPicker = document.getElementById('link-tint-color');
 linkTintPicker?.addEventListener('input', (e) => {
   shaderUniforms.uLinkTintColor.value.set(e.target.value);
-  buildLines();
 });
   initUniformsFromDOM();
 }

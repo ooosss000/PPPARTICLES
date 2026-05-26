@@ -44,6 +44,11 @@ body {
   display: block;
 }
 
+#webgl canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
 /* Rigid Panel Design */
 .glass-panel {
   background: var(--panel-bg);
@@ -493,4 +498,35 @@ input[type="color"]::-webkit-color-swatch {
   .instructions-hud {
     display: none;
   }
+}
+
+/* Custom recording and playing states */
+.btn-recording {
+  border-color: #ef4444 !important;
+  color: #ef4444 !important;
+}
+
+.btn-recording:hover {
+  background: #ef4444 !important;
+  color: #ffffff !important;
+}
+
+.btn-active {
+  border-color: #00ffcc !important;
+  color: #00ffcc !important;
+}
+
+.btn-active:hover {
+  background: #00ffcc !important;
+  color: #000000 !important;
+}
+
+@keyframes pulse {
+  0% { opacity: 0.4; }
+  50% { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+.pulse-icon {
+  animation: pulse 1.2s infinite ease-in-out;
 }

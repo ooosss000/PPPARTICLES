@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Detailed 3D Particle Image Converter</title>
+  <title>PPPARTICLES</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
   
-  <script type="module" crossorigin src="/assets/index-5143dcb3.js"></script>
-  <link rel="stylesheet" href="/assets/index-a6d6c511.css">
+  <script type="module" crossorigin src="/assets/index-0e0429b0.js"></script>
+  <link rel="stylesheet" href="/assets/index-dcba3079.css">
 </head>
 <body>
   <!-- Canvas for Three.js rendering -->
@@ -23,7 +23,7 @@
     <header class="panel-header">
       <div class="logo-area">
         <span class="logo-dot"></span>
-        <h1>PARTICLE SAGA</h1>
+        <h1>PPPARTICLES</h1>
         <span class="badge">v2.0</span>
       </div>
       <p class="subtitle">Convert 2D Images to High-Detail 3D Particles</p>
@@ -60,18 +60,18 @@
         <div class="control-row">
           <div class="control-label">
             <label for="res-step">Grid Sampling Step</label>
-            <span class="val-display" id="res-step-val">2px</span>
+            <span class="val-display" id="res-step-val">1px</span>
           </div>
-          <input type="range" id="res-step" min="1" max="12" step="1" value="2">
+          <input type="range" id="res-step" min="1" max="12" step="1" value="1">
           <p class="help-text">Lower values = more detailed points (higher density).</p>
         </div>
 
         <div class="control-row">
           <div class="control-label">
             <label for="point-size">Particle Size</label>
-            <span class="val-display" id="point-size-val">1.5</span>
+            <span class="val-display" id="point-size-val">0.7</span>
           </div>
-          <input type="range" id="point-size" min="0.1" max="15.0" step="0.1" value="1.5">
+          <input type="range" id="point-size" min="0.1" max="15.0" step="0.1" value="0.7">
         </div>
 
         <div class="control-row">
@@ -114,18 +114,22 @@
 
       <!-- Section: Particle Scatter -->
       <section class="control-group">
-        <h2>Particle Scatter</h2>
+        <h2>Organic Floating (Per-Particle)</h2>
+        <div class="control-row checkbox-row">
+          <input type="checkbox" id="enable-organic-float">
+          <label for="enable-organic-float">Enable Organic Floating</label>
+        </div>
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-amp">Scatter Amplitude</label>
-            <span class="val-display" id="scatter-amp-val">0</span>
+            <label for="scatter-amp">Floating Amplitude</label>
+            <span class="val-display" id="scatter-amp-val">5.0</span>
           </div>
-          <input type="range" id="scatter-amp" min="0" max="50" step="0.5" value="0">
+          <input type="range" id="scatter-amp" min="0" max="50" step="0.5" value="5.0">
         </div>
 
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-freq">Scatter Frequency</label>
+            <label for="scatter-freq">Floating Frequency</label>
             <span class="val-display" id="scatter-freq-val">0.05</span>
           </div>
           <input type="range" id="scatter-freq" min="0.001" max="0.2" step="0.001" value="0.05">
@@ -133,10 +137,85 @@
 
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-speed">Scatter Speed</label>
-            <span class="val-display" id="scatter-speed-val">0.0</span>
+            <label for="scatter-speed">Floating Speed</label>
+            <span class="val-display" id="scatter-speed-val">1.0</span>
           </div>
-          <input type="range" id="scatter-speed" min="0.0" max="5.0" step="0.1" value="0.0">
+          <input type="range" id="scatter-speed" min="0.0" max="5.0" step="0.1" value="1.0">
+        </div>
+
+        <div class="control-row" style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+          <div class="control-label">
+            <label for="organic-field-strength">Organic Field Strength</label>
+            <span class="val-display" id="organic-field-strength-val">0.0</span>
+          </div>
+          <input type="range" id="organic-field-strength" min="0.0" max="5.0" step="0.1" value="0.0">
+          <p class="help-text">Applies mathematical flow fields (attractors/noise) for organic movement.</p>
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="organic-field-speed">Organic Field Speed</label>
+            <span class="val-display" id="organic-field-speed-val">1.2</span>
+          </div>
+          <input type="range" id="organic-field-speed" min="0.1" max="5.0" step="0.1" value="1.2">
+        </div>
+      </section>
+
+      <!-- Section: Interconnection Links -->
+      <section class="control-group">
+        <h2>Interconnection Links</h2>
+        <div class="control-row checkbox-row">
+          <input type="checkbox" id="enable-links">
+          <label for="enable-links">Enable Connection Links</label>
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="link-opacity">Link Opacity</label>
+            <span class="val-display" id="link-opacity-val">0.30</span>
+          </div>
+          <input type="range" id="link-opacity" min="0.01" max="1.00" step="0.01" value="0.30">
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="link-max-dist">Max Distance</label>
+            <span class="val-display" id="link-max-dist-val">35</span>
+          </div>
+          <input type="range" id="link-max-dist" min="5" max="150" step="1" value="35">
+          <p class="help-text">Maximum 3D distance between particles to form a link.</p>
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="link-thickness">Link Thickness</label>
+            <span class="val-display" id="link-thickness-val">2.0</span>
+          </div>
+          <input type="range" id="link-thickness" min="0.5" max="10.0" step="0.5" value="2.0">
+          <p class="help-text">Thickness of connecting lines in screen-space pixels.</p>
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="link-glow">Link Glow Intensity</label>
+            <span class="val-display" id="link-glow-val">1.5</span>
+          </div>
+          <input type="range" id="link-glow" min="0.1" max="15.0" step="0.1" value="1.5">
+          <p class="help-text">HDR glow intensity driving post-processing bloom.</p>
+        </div>
+
+        <div class="control-row">
+          <label for="link-color-mode">Link Color Mode</label>
+          <select id="link-color-mode">
+            <option value="match-particles" selected>Match Particle Color</option>
+            <option value="tint">Custom Tint Color</option>
+            <option value="depth-gradient">Depth Gradient</option>
+          </select>
+        </div>
+
+        <div id="link-tint-picker-wrapper" class="control-row" style="display: none;">
+          <label for="link-tint-color">Link Tint</label>
+          <input type="color" id="link-tint-color" value="#ffffff">
         </div>
       </section>
 
@@ -155,9 +234,9 @@
         <div class="control-row">
           <div class="control-label">
             <label for="point-opacity">Point Opacity</label>
-            <span class="val-display" id="point-opacity-val">0.60</span>
+            <span class="val-display" id="point-opacity-val">0.85</span>
           </div>
-          <input type="range" id="point-opacity" min="0.01" max="1.00" step="0.01" value="0.60">
+          <input type="range" id="point-opacity" min="0.01" max="1.00" step="0.01" value="0.85">
         </div>
 
         <div class="control-row">
@@ -185,6 +264,27 @@
         </div>
       </section>
 
+      <!-- Section: Post-Processing & Optics -->
+      <section class="control-group">
+        <h2>Post-Processing & Optics</h2>
+        <div class="control-row">
+          <div class="control-label">
+            <label for="bloom-strength">Bloom Glow Strength</label>
+            <span class="val-display" id="bloom-strength-val">0.2</span>
+          </div>
+          <input type="range" id="bloom-strength" min="0.0" max="3.0" step="0.1" value="0.2">
+          <p class="help-text">Premium optical glow effect. Disable (0.0) for better performance.</p>
+        </div>
+
+        <div class="control-row">
+          <div class="control-label">
+            <label for="bloom-radius">Bloom Radius</label>
+            <span class="val-display" id="bloom-radius-val">0.2</span>
+          </div>
+          <input type="range" id="bloom-radius" min="0.0" max="1.5" step="0.1" value="0.2">
+        </div>
+      </section>
+
       <!-- Section: Color Grading & Lighting -->
       <section class="control-group">
         <h2>Color Grading & Lighting</h2>
@@ -205,25 +305,25 @@
         <div class="control-row">
           <div class="control-label">
             <label for="exposure">Exposure</label>
-            <span class="val-display" id="exposure-val">1.0</span>
+            <span class="val-display" id="exposure-val">1.2</span>
           </div>
-          <input type="range" id="exposure" min="0.2" max="3.0" step="0.05" value="1.0">
+          <input type="range" id="exposure" min="0.2" max="3.0" step="0.05" value="1.2">
         </div>
 
         <div class="control-row">
           <div class="control-label">
             <label for="contrast">Contrast</label>
-            <span class="val-display" id="contrast-val">1.1</span>
+            <span class="val-display" id="contrast-val">1.3</span>
           </div>
-          <input type="range" id="contrast" min="0.5" max="2.0" step="0.05" value="1.1">
+          <input type="range" id="contrast" min="0.5" max="2.0" step="0.05" value="1.3">
         </div>
 
         <div class="control-row">
           <div class="control-label">
             <label for="saturation">Saturation</label>
-            <span class="val-display" id="saturation-val">1.0</span>
+            <span class="val-display" id="saturation-val">1.15</span>
           </div>
-          <input type="range" id="saturation" min="0.0" max="2.0" step="0.05" value="1.0">
+          <input type="range" id="saturation" min="0.0" max="2.0" step="0.05" value="1.15">
         </div>
 
         <div class="control-row checkbox-row">
@@ -264,9 +364,9 @@
         <div class="control-row">
           <div class="control-label">
             <label for="drift-amp">Micro-Drift Amplitude</label>
-            <span class="val-display" id="drift-amp-val">10</span>
+            <span class="val-display" id="drift-amp-val">0</span>
           </div>
-          <input type="range" id="drift-amp" min="0" max="50" step="1" value="10">
+          <input type="range" id="drift-amp" min="0" max="50" step="1" value="0">
         </div>
 
         <div class="control-row">
@@ -283,7 +383,41 @@
             <button id="cam-reset" class="btn btn-secondary">Center</button>
             <button id="cam-iso" class="btn btn-secondary">Isometric</button>
             <button id="cam-side" class="btn btn-secondary">Side Profile</button>
+            <button id="cam-top" class="btn btn-secondary">Top Down</button>
+            <button id="cam-macro" class="btn btn-secondary">Macro Detail</button>
+            <button id="cam-cinematic" class="btn btn-primary" style="grid-column: span 2;">Cinematic Sequence</button>
           </div>
+        </div>
+      </section>
+
+      <!-- Section: Custom Motion Timeline -->
+      <section class="control-group">
+        <h2>Custom Motion Timeline</h2>
+        <div class="control-row">
+          <div class="control-label">
+            <label for="timeline-speed">Transition Speed</label>
+            <span class="val-display" id="timeline-speed-val">4.0s</span>
+          </div>
+          <input type="range" id="timeline-speed" min="1.0" max="15.0" step="0.5" value="4.0">
+          <p class="help-text">Duration of camera flight between each keyframe.</p>
+        </div>
+
+        <div class="export-grid" style="margin-bottom: 8px;">
+          <button id="btn-add-keyframe" class="btn btn-secondary" style="grid-column: span 2;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="12" y2="12"/></svg>
+            Add Keyframe
+          </button>
+          <button id="btn-clear-timeline" class="btn btn-secondary">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+            Clear List
+          </button>
+          <button id="btn-play-timeline" class="btn btn-primary">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Play Path
+          </button>
+        </div>
+        <div id="timeline-hud" style="font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); text-align: center;">
+          0 Keyframes Captured
         </div>
       </section>
 
@@ -306,6 +440,10 @@
           <button id="btn-export-png" class="btn btn-secondary">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
             High-Res PNG
+          </button>
+          <button id="btn-record-video" class="btn btn-primary" style="grid-column: span 2; margin-top: 8px;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6"/></svg>
+            Record Video (MP4/WebM)
           </button>
         </div>
       </section>
