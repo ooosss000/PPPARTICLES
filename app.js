@@ -1311,7 +1311,7 @@ function buildLines() {
     transparent: true,
     depthTest: true,
     depthWrite: false, // Don't write depth to avoid sorting issues with fine lines
-    blending: THREE.AdditiveBlending // Additive blending for glowing mesh appearance
+    blending: THREE.NormalBlending // Changed to NormalBlending to prevent excessive accumulation and white-out
   });
 
   lineSystem = new THREE.Mesh(lineGeometry, lineMaterial);
