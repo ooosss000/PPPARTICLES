@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
   
-  <script type="module" crossorigin src="/assets/index-56c17aa3.js"></script>
+  <script type="module" crossorigin src="/assets/index-32a740a0.js"></script>
   <link rel="stylesheet" href="/assets/index-dcba3079.css">
 </head>
 <body>
@@ -60,18 +60,18 @@
         <div class="control-row">
           <div class="control-label">
             <label for="res-step">Grid Sampling Step</label>
-            <span class="val-display" id="res-step-val">1px</span>
+            <span class="val-display" id="res-step-val">2px</span>
           </div>
-          <input type="range" id="res-step" min="1" max="12" step="1" value="1">
+          <input type="range" id="res-step" min="1" max="12" step="1" value="2">
           <p class="help-text">Lower values = more detailed points (higher density).</p>
         </div>
 
         <div class="control-row">
           <div class="control-label">
             <label for="point-size">Particle Size</label>
-            <span class="val-display" id="point-size-val">0.7</span>
+            <span class="val-display" id="point-size-val">2.0</span>
           </div>
-          <input type="range" id="point-size" min="0.1" max="15.0" step="0.1" value="0.7">
+          <input type="range" id="point-size" min="0.1" max="50.0" step="0.1" value="2.0">
         </div>
 
         <div class="control-row">
@@ -114,14 +114,14 @@
 
       <!-- Section: Particle Scatter -->
       <section class="control-group">
-        <h2>Organic Floating (Per-Particle)</h2>
+        <h2>Wind Force Effect</h2>
         <div class="control-row checkbox-row">
           <input type="checkbox" id="enable-organic-float">
-          <label for="enable-organic-float">Enable Organic Floating</label>
+          <label for="enable-organic-float">Enable Wind Force</label>
         </div>
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-amp">Floating Amplitude</label>
+            <label for="scatter-amp">Wind Force</label>
             <span class="val-display" id="scatter-amp-val">5.0</span>
           </div>
           <input type="range" id="scatter-amp" min="0" max="50" step="0.5" value="5.0">
@@ -129,7 +129,7 @@
 
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-freq">Floating Frequency</label>
+            <label for="scatter-freq">Wind Dimension</label>
             <span class="val-display" id="scatter-freq-val">0.05</span>
           </div>
           <input type="range" id="scatter-freq" min="0.001" max="0.2" step="0.001" value="0.05">
@@ -137,7 +137,7 @@
 
         <div class="control-row">
           <div class="control-label">
-            <label for="scatter-speed">Floating Speed</label>
+            <label for="scatter-speed">Auto Movement Speed</label>
             <span class="val-display" id="scatter-speed-val">1.0</span>
           </div>
           <input type="range" id="scatter-speed" min="0.0" max="5.0" step="0.1" value="1.0">
@@ -225,10 +225,20 @@
         <div class="control-row">
           <label for="point-shape">Point Shape (Style)</label>
           <select id="point-shape">
-            <option value="0" selected>Soft Splat (Gaussian)</option>
-            <option value="1">Hard Circle</option>
+            <option value="0">Soft Splat (Gaussian)</option>
+            <option value="1" selected>Hard Circle</option>
             <option value="2">Square</option>
           </select>
+        </div>
+
+        <div class="control-row checkbox-row">
+          <input type="checkbox" id="enable-anti-alias" checked>
+          <label for="enable-anti-alias">Anti-Aliasing (Smooth Points)</label>
+        </div>
+
+        <div class="control-row checkbox-row">
+          <input type="checkbox" id="enable-depth-write">
+          <label for="enable-depth-write">Enable Depth Write (Occlusion)</label>
         </div>
 
         <div class="control-row">
@@ -270,9 +280,9 @@
         <div class="control-row">
           <div class="control-label">
             <label for="bloom-strength">Bloom Glow Strength</label>
-            <span class="val-display" id="bloom-strength-val">0.2</span>
+            <span class="val-display" id="bloom-strength-val">0.5</span>
           </div>
-          <input type="range" id="bloom-strength" min="0.0" max="3.0" step="0.1" value="0.2">
+          <input type="range" id="bloom-strength" min="0.0" max="3.0" step="0.1" value="0.5">
           <p class="help-text">Premium optical glow effect. Disable (0.0) for better performance.</p>
         </div>
 

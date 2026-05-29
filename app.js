@@ -54,6 +54,14 @@ const USE_PROCEDURAL_FALLBACK_ON_CORS = true;
 // UI State
 let uiCollapsed = false;
 
+// Wind Globe Interactive State
+let windGlobe = null;
+let isDraggingGlobe = false;
+let globeRaycaster = new THREE.Raycaster();
+let mouseVector = new THREE.Vector2();
+let dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+let windGlobeAnchor = new THREE.Vector3(0, 0, 0);
+
 // Default shader parameters (will be overridden by DOM on initialization)
 const shaderUniforms = {
   uPointSize: { value: 1.5 },
@@ -90,7 +98,11 @@ const shaderUniforms = {
   uLinkTintColor: { value: new THREE.Color('#ffffff') },
   linewidth: { value: 2.0 },
   resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-  uLinkGlow: { value: 1.5 }
+  uLinkGlow: { value: 0.8 },
+  uAntiAlias: { value: true },
+  uWindCenter: { value: new THREE.Vector3(0, 0, 0) },
+  uWindRadius: { value: 0.0 },
+  uSphereRotationMatrix: { value: new THREE.Matrix3() }
 };
 
 // --- Custom Shaders for Real-Time Performance ---
@@ -106,6 +118,9 @@ const vertexShader = `
   uniform float uOrganicFieldStrength;
   uniform float uOrganicFieldSpeed;
   uniform bool uEnableFloating;
+  uniform vec3 uWindCenter;
+  uniform float uWindRadius;
+  uniform mat3 uSphereRotationMatrix;
 
   attribute float pixelVal;
   attribute vec3 originalColor;
@@ -123,6 +138,78 @@ const vertexShader = `
     return fract(p.x * p.y * p.z);
   }
 
+  mat3 transposeMat3(mat3 m) {
+    return mat3(
+      m[0][0], m[1][0], m[2][0],
+      m[0][1], m[1][1], m[2][1],
+      m[0][2], m[1][2], m[2][2]
+    );
+  }
+
+  vec3 applyVortexWind(vec3 basePos, vec3 windCenter, float windRadius, float scatterAmp, float scatterSpeed, float time, mat3 sphereRotMat, bool enableFloating) {
+    if (!enableFloating || scatterAmp <= 0.0 || windRadius <= 0.0) {
+      return basePos;
+    }
+    vec3 toCenter = basePos - windCenter;
+    float dist = length(toCenter.xy);
+    if (dist >= windRadius) {
+      return basePos;
+    }
+    
+    float normalizedDist = 1.0 - (dist / windRadius);
+    float falloff = smoothstep(0.0, 1.0, normalizedDist);
+    falloff = pow(falloff, 1.5); // Smoother ease-in for cinematic grouping
+    
+    // Transform to local space of the rotating sphere
+    vec3 localPos = sphereRotMat * toCenter;
+    
+    // Vortex twisting (rotates around local Z-axis)
+    float twistAngle = falloff * scatterAmp * time * scatterSpeed * 0.1;
+    float c = cos(twistAngle);
+    float s = sin(twistAngle);
+    vec3 twistedLocal = localPos;
+    twistedLocal.x = localPos.x * c - localPos.y * s;
+    twistedLocal.y = localPos.x * s + localPos.y * c;
+    
+    // Suction towards center and lift along Z
+    vec3 pullDir = -normalize(localPos);
+    float pullStrength = falloff * scatterAmp * 2.0;
+    float liftStrength = falloff * scatterAmp * 4.0;
+    vec3 forceVecLocal = vec3(0.0, 0.0, liftStrength) + pullDir * pullStrength;
+    twistedLocal += forceVecLocal;
+    
+    // Fluid Turbulence (multi-octave curl-like field)
+    vec3 turbLocal = vec3(0.0);
+    float amp = 1.0;
+    float freq = 2.0 / windRadius;
+    for (int i = 0; i < 3; i++) {
+      vec3 coord = twistedLocal * freq + vec3(0.0, 0.0, time * scatterSpeed * 1.5);
+      vec3 sVal = sin(coord.yzx * 2.0);
+      vec3 cVal = cos(coord.zxy * 1.5);
+      turbLocal += (sVal + cVal) * amp;
+      amp *= 0.5;
+      freq *= 2.0;
+    }
+    
+    twistedLocal += turbLocal * falloff * scatterAmp * 3.0;
+    
+    // Transform back to world space
+    mat3 invRotation = transposeMat3(sphereRotMat);
+    vec3 displacedOffset = invRotation * twistedLocal;
+    
+    vec3 finalPosRelative = mix(toCenter, displacedOffset, falloff);
+    vec3 movement = finalPosRelative - toCenter;
+    float moveLen = length(movement);
+    
+    // Cap movement to prevent particles from flying too far out
+    float maxMove = scatterAmp * 15.0; 
+    if (moveLen > maxMove && maxMove > 0.0) {
+        movement *= (maxMove / moveLen);
+    }
+    
+    return windCenter + toCenter + movement;
+  }
+
   void main() {
     vColor = originalColor;
 
@@ -130,24 +217,11 @@ const vertexShader = `
     vRand = hash(position + vec3(17.3, 31.4, 9.7));
 
     // Apply scale to X and Y coordinates and displace Z along depth modulator
-    vec3 displaced = vec3(position.x * uModelScale, position.y * uModelScale, position.z);
-    displaced.z += pixelVal * uDepthScale;
+    vec3 basePos = vec3(position.x * uModelScale, position.y * uModelScale, position.z);
+    basePos.z += pixelVal * uDepthScale;
 
-    // Per-Particle Organic Floating
-    if (uEnableFloating && uScatterAmp > 0.0) {
-      // Create a unique pseudo-random phase for each particle based on its position
-      float phase = hash(position * 123.456) * 100.0;
-      float t = uTime * uScatterSpeed;
-      float f = uScatterFreq * 10.0; 
-      
-      vec3 floatOffset = vec3(
-        sin(t + phase) * cos(t * 0.8 * f + phase * 1.2),
-        sin(t * 1.1 * f + phase * 2.0) * cos(t * 0.9 + phase * 0.8),
-        sin(t * 0.9 + phase * 1.5) * cos(t * 1.2 * f + phase)
-      ) * uScatterAmp;
-      
-      displaced += floatOffset;
-    }
+    // Apply Rotating Twisting Vortex Wind Effect
+    vec3 displaced = applyVortexWind(basePos, uWindCenter, uWindRadius, uScatterAmp, uScatterSpeed, uTime, uSphereRotationMatrix, uEnableFloating);
 
     // Organic Field Displacement (Mathematical Attractor)
     if (uOrganicFieldStrength > 0.0) {
@@ -191,6 +265,7 @@ const fragmentShader = `
   uniform float uDepthScale;
   uniform int uPointShape;
   uniform float uPointOpacity;
+  uniform bool uAntiAlias;
 
   // Luma-style lighting and color grading uniforms
   uniform bool uEnableShading;
@@ -261,8 +336,16 @@ const fragmentShader = `
       alpha *= exp(-splatDistSq * 9.0) * 1.5;
     } 
     else if (uPointShape == 1) { // Hard Circle
-      if (distSq > 0.25) {
-        discard;
+      if (uAntiAlias) {
+        float dist = sqrt(distSq);
+        if (dist > 0.5) {
+          discard;
+        }
+        alpha *= smoothstep(0.5, 0.45, dist);
+      } else {
+        if (distSq > 0.25) {
+          discard;
+        }
       }
     }
     // uPointShape == 2 is Square (standard WebGL block points)
@@ -338,6 +421,9 @@ const lineVertexShader = `
   uniform float uOrganicFieldStrength;
   uniform float uOrganicFieldSpeed;
   uniform bool uEnableFloating;
+  uniform vec3 uWindCenter;
+  uniform float uWindRadius;
+  uniform mat3 uSphereRotationMatrix;
 
   uniform float linewidth;
   uniform vec2 resolution;
@@ -357,10 +443,76 @@ const lineVertexShader = `
   varying vec3 vNormal;
   varying vec2 vUv;
 
-  float hash(vec3 p) {
-    p = fract(p * 0.3183099 + vec3(0.1, 0.1, 0.1));
-    p += dot(p, p.yzx + 33.33);
-    return fract(p.x * p.y * p.z);
+  mat3 transposeMat3(mat3 m) {
+    return mat3(
+      m[0][0], m[1][0], m[2][0],
+      m[0][1], m[1][1], m[2][1],
+      m[0][2], m[1][2], m[2][2]
+    );
+  }
+
+  vec3 applyVortexWind(vec3 basePos, vec3 windCenter, float windRadius, float scatterAmp, float scatterSpeed, float time, mat3 sphereRotMat, bool enableFloating) {
+    if (!enableFloating || scatterAmp <= 0.0 || windRadius <= 0.0) {
+      return basePos;
+    }
+    vec3 toCenter = basePos - windCenter;
+    float dist = length(toCenter.xy);
+    if (dist >= windRadius) {
+      return basePos;
+    }
+    
+    float normalizedDist = 1.0 - (dist / windRadius);
+    float falloff = smoothstep(0.0, 1.0, normalizedDist);
+    falloff = pow(falloff, 1.5); // Smoother ease-in for cinematic grouping
+    
+    // Transform to local space of the rotating sphere
+    vec3 localPos = sphereRotMat * toCenter;
+    
+    // Vortex twisting (rotates around local Z-axis)
+    float twistAngle = falloff * scatterAmp * time * scatterSpeed * 0.1;
+    float c = cos(twistAngle);
+    float s = sin(twistAngle);
+    vec3 twistedLocal = localPos;
+    twistedLocal.x = localPos.x * c - localPos.y * s;
+    twistedLocal.y = localPos.x * s + localPos.y * c;
+    
+    // Suction towards center and lift along Z
+    vec3 pullDir = -normalize(localPos);
+    float pullStrength = falloff * scatterAmp * 2.0;
+    float liftStrength = falloff * scatterAmp * 4.0;
+    vec3 forceVecLocal = vec3(0.0, 0.0, liftStrength) + pullDir * pullStrength;
+    twistedLocal += forceVecLocal;
+    
+    // Fluid Turbulence (multi-octave curl-like field)
+    vec3 turbLocal = vec3(0.0);
+    float amp = 1.0;
+    float freq = 2.0 / windRadius;
+    for (int i = 0; i < 3; i++) {
+      vec3 coord = twistedLocal * freq + vec3(0.0, 0.0, time * scatterSpeed * 1.5);
+      vec3 sVal = sin(coord.yzx * 2.0);
+      vec3 cVal = cos(coord.zxy * 1.5);
+      turbLocal += (sVal + cVal) * amp;
+      amp *= 0.5;
+      freq *= 2.0;
+    }
+    
+    twistedLocal += turbLocal * falloff * scatterAmp * 3.0;
+    
+    // Transform back to world space
+    mat3 invRotation = transposeMat3(sphereRotMat);
+    vec3 displacedOffset = invRotation * twistedLocal;
+    
+    vec3 finalPosRelative = mix(toCenter, displacedOffset, falloff);
+    vec3 movement = finalPosRelative - toCenter;
+    float moveLen = length(movement);
+    
+    // Cap movement to prevent particles from flying too far out
+    float maxMove = scatterAmp * 15.0; 
+    if (moveLen > maxMove && maxMove > 0.0) {
+        movement *= (maxMove / moveLen);
+    }
+    
+    return windCenter + toCenter + movement;
   }
 
   void main() {
@@ -374,25 +526,9 @@ const lineVertexShader = `
     vec3 displacedEnd = vec3(instanceEnd.x * uModelScale, instanceEnd.y * uModelScale, instanceEnd.z);
     displacedEnd.z += pixelValEnd * uDepthScale;
 
-    // 2. Apply Organic Floating offsets to start and end
-    if (uEnableFloating && uScatterAmp > 0.0) {
-      float phaseStart = hash(instanceStart * 123.456) * 100.0;
-      float phaseEnd = hash(instanceEnd * 123.456) * 100.0;
-      float t = uTime * uScatterSpeed;
-      float f = uScatterFreq * 10.0;
-      
-      displacedStart += vec3(
-        sin(t + phaseStart) * cos(t * 0.8 * f + phaseStart * 1.2),
-        sin(t * 1.1 * f + phaseStart * 2.0) * cos(t * 0.9 + phaseStart * 0.8),
-        sin(t * 0.9 + phaseStart * 1.5) * cos(t * 1.2 * f + phaseStart)
-      ) * uScatterAmp;
-      
-      displacedEnd += vec3(
-        sin(t + phaseEnd) * cos(t * 0.8 * f + phaseEnd * 1.2),
-        sin(t * 1.1 * f + phaseEnd * 2.0) * cos(t * 0.9 + phaseEnd * 0.8),
-        sin(t * 0.9 + phaseEnd * 1.5) * cos(t * 1.2 * f + phaseEnd)
-      ) * uScatterAmp;
-    }
+    // 2. Apply Twisting Vortex Wind Effect to start and end
+    displacedStart = applyVortexWind(displacedStart, uWindCenter, uWindRadius, uScatterAmp, uScatterSpeed, uTime, uSphereRotationMatrix, uEnableFloating);
+    displacedEnd = applyVortexWind(displacedEnd, uWindCenter, uWindRadius, uScatterAmp, uScatterSpeed, uTime, uSphereRotationMatrix, uEnableFloating);
 
     // 3. Apply Organic Flow Field Attractor to start and end
     if (uOrganicFieldStrength > 0.0) {
@@ -601,8 +737,13 @@ const lineFragmentShader = `
       gradedColor = mix(gradedColor, tintedColor, uTintMix);
     }
 
-    // Output with HDR Link Glow multiplier to boost bloom bloom pass intensity
-    gl_FragColor = vec4(gradedColor * uLinkGlow, clamp(uLinkOpacity, 0.0, 1.0));
+    // Output with HDR Link Glow multiplier, soft-capped to prevent washing out entire image
+    vec3 hdrColor = gradedColor * uLinkGlow;
+    float lumaHDR = dot(hdrColor, vec3(0.299, 0.587, 0.114));
+    if (lumaHDR > 1.5) {
+      hdrColor = mix(hdrColor, normalize(hdrColor + vec3(0.001)) * 1.5, 0.8);
+    }
+    gl_FragColor = vec4(hdrColor, clamp(uLinkOpacity, 0.0, 1.0));
   }
 `;
 
@@ -627,7 +768,7 @@ function init() {
   const renderScene = new RenderPass(scene, camera);
   bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
   bloomPass.threshold = 0.0;
-  bloomPass.strength = 0.5; // Default strength
+  bloomPass.strength = 0.3; // Default strength reduced
   bloomPass.radius = 0.5;
   
   composer = new EffectComposer(renderer);
@@ -680,6 +821,13 @@ function init() {
 
   // Window Resize
   window.addEventListener('resize', onWindowResize);
+
+  // Init Wind Globe
+  const globeGeo = new THREE.SphereGeometry(1, 16, 16);
+  const globeMat = new THREE.MeshBasicMaterial({ color: 0x00f2fe, wireframe: true, transparent: true, opacity: 0.3 });
+  windGlobe = new THREE.Mesh(globeGeo, globeMat);
+  scene.add(windGlobe);
+  windGlobe.visible = false;
 
   // Setup Event Listeners
   setupEventListeners();
@@ -1002,6 +1150,8 @@ function buildParticles() {
   geometry.setAttribute('pixelVal', new THREE.Float32BufferAttribute(pixelVals, 1));
   geometry.setAttribute('depthGradient', new THREE.Float32BufferAttribute(depthGradients, 2));
 
+  const enableDepthWrite = document.getElementById('enable-depth-write') ? document.getElementById('enable-depth-write').checked : false;
+
   // Custom Shader Material
   const material = new THREE.ShaderMaterial({
     vertexShader: vertexShader,
@@ -1009,7 +1159,7 @@ function buildParticles() {
     uniforms: shaderUniforms,
     transparent: true,
     depthTest: true,
-    depthWrite: true,
+    depthWrite: enableDepthWrite,
     blending: THREE.NormalBlending
   });
 
@@ -1205,11 +1355,61 @@ function animate(time) {
     controls.autoRotateSpeed = driftSpeed * 2.0;
     controls.update();
   }
-  
+
+  // --- Twisting Vortex Wind Globe Physics & Animation ---
+  if (windGlobe) {
+    const modelScale = parseFloat(document.getElementById('model-scale').value);
+    const scatterFreq = parseFloat(document.getElementById('scatter-freq').value);
+    const autoSpeed = parseFloat(document.getElementById('scatter-speed').value);
+    const enableFloat = document.getElementById('enable-organic-float').checked;
+
+    // 1. Auto movement drift (if enabled and user is not dragging)
+    if (!isDraggingGlobe && enableFloat && autoSpeed > 0) {
+      // Smooth Lissajous curve wandering around the anchor position chosen by the user
+      const t = dt * autoSpeed * 0.2;
+      const offsetX = Math.sin(t * 1.5) * 0.25 * modelScale;
+      const offsetY = Math.cos(t * 0.9) * 0.25 * modelScale;
+      windGlobe.position.set(windGlobeAnchor.x + offsetX, windGlobeAnchor.y + offsetY, 0.0);
+    }
+
+    // 2. Sync uWindCenter to the globe's position
+    shaderUniforms.uWindCenter.value.copy(windGlobe.position);
+    shaderUniforms.uWindRadius.value = scatterFreq * modelScale;
+
+    // 3. Globe Mesh Rotation (twisting containers)
+    if (enableFloat) {
+      // Rotation speed increases with scatter speed
+      const rotSpeed = autoSpeed * 0.5 + 0.2;
+      windGlobe.rotation.y += rotSpeed * 0.01;
+      windGlobe.rotation.x += rotSpeed * 0.005;
+      windGlobe.rotation.z += rotSpeed * 0.003;
+    }
+    windGlobe.updateMatrixWorld();
+
+    // 4. Update uSphereRotationMatrix
+    const tempMatrix4 = new THREE.Matrix4().makeRotationFromEuler(windGlobe.rotation);
+    shaderUniforms.uSphereRotationMatrix.value.setFromMatrix4(tempMatrix4);
+  }
+
+  // --- Temporary Masking of Wind Globe in Render (For Clean Video Recording) ---
+  let wasGlobeVisible = false;
+  if (windGlobe) {
+    wasGlobeVisible = windGlobe.visible;
+    // Hide during recording rendering
+    if (isRecording) {
+      windGlobe.visible = false;
+    }
+  }
+
   if (composer && scene && camera) {
     composer.render();
   } else if (renderer && scene && camera) {
     renderer.render(scene, camera);
+  }
+
+  // Restore globe visibility right after render
+  if (windGlobe) {
+    windGlobe.visible = wasGlobeVisible;
   }
 
   updateHUD(time);
@@ -1231,6 +1431,15 @@ function computeExportPoints() {
   const tintColorHex = document.getElementById('monochrome-color').value;
   const tintColor = new THREE.Color(tintColorHex);
   const modelScale = parseFloat(document.getElementById('model-scale').value);
+  
+  // Twisting Vortex Wind Force CPU parameters matching GPU
+  const time = shaderUniforms.uTime.value;
+  const scatterSpeed = parseFloat(document.getElementById('scatter-speed').value);
+  const windCenter = shaderUniforms.uWindCenter.value;
+  const windRadius = shaderUniforms.uWindRadius.value;
+  const sphereRotMat = shaderUniforms.uSphereRotationMatrix.value;
+  const invRotation = sphereRotMat.clone().transpose();
+  const enableFloating = document.getElementById('enable-organic-float').checked;
 
   // Lighting & Color Grading CPU variables
   const enableShading = document.getElementById('enable-shading').checked;
@@ -1259,15 +1468,6 @@ function computeExportPoints() {
 
   const den = height;
   const resultPoints = [];
-
-  // Basic CPU-side noise generator helper
-  function hash(x, y, z) {
-    const dot = x * 0.3183099 + y * 0.3183099 + z * 0.3183099;
-    const fractX = Math.abs(Math.sin(dot + 0.1) * 33.33) % 1;
-    const fractY = Math.abs(Math.cos(dot + 0.2) * 44.44) % 1;
-    const fractZ = Math.abs(Math.sin(dot + 0.3) * 55.55) % 1;
-    return (fractX + fractY + fractZ) / 3;
-  }
 
   function getDepthVal(px, py) {
     const cx = Math.max(0, Math.min(px, width - 1));
@@ -1312,15 +1512,102 @@ function computeExportPoints() {
       const depthVal = getDepthVal(x, y);
       posZ += depthVal * depthScale;
 
-      // Scatter (Static representation of scatter for export)
+      // Twisting Vortex Wind Force (Rotating Container matching GPU)
       let fx = posX, fy = posY, fz = posZ;
-      if (scatterAmp > 0.0) {
-        const sx = hash(posX + 11.1, posY + 17.3, 0.0);
-        const sy = hash(posX + 23.4, posY + 31.8, 0.0);
-        const sz = hash(posX + 47.9, posY + 93.1, 0.0);
-        fx += (sx - 0.5) * scatterAmp;
-        fy += (sy - 0.5) * scatterAmp;
-        fz += (sz - 0.5) * scatterAmp;
+      if (enableFloating && scatterAmp > 0.0 && windRadius > 0.0) {
+        const dx = posX - windCenter.x;
+        const dy = posY - windCenter.y;
+        const dz = posZ - windCenter.z;
+        const dist = Math.hypot(dx, dy);
+        
+        if (dist < windRadius) {
+          const normalizedDist = 1.0 - (dist / windRadius);
+          // smoothstep + cinematic grouping ease
+          let falloff = normalizedDist * normalizedDist * (3.0 - 2.0 * normalizedDist);
+          falloff = Math.pow(falloff, 1.5);
+          
+          // 1. Transform to local space of the rotating sphere
+          const localX = sphereRotMat.elements[0] * dx + sphereRotMat.elements[3] * dy + sphereRotMat.elements[6] * dz;
+          const localY = sphereRotMat.elements[1] * dx + sphereRotMat.elements[4] * dy + sphereRotMat.elements[7] * dz;
+          const localZ = sphereRotMat.elements[2] * dx + sphereRotMat.elements[5] * dy + sphereRotMat.elements[8] * dz;
+          
+          // 2. Vortex twisting (rotates around local Z-axis)
+          const twistAngle = falloff * scatterAmp * time * scatterSpeed * 0.1;
+          const c = Math.cos(twistAngle);
+          const s = Math.sin(twistAngle);
+          let twistedLocalX = localX * c - localY * s;
+          let twistedLocalY = localX * s + localY * c;
+          let twistedLocalZ = localZ;
+          
+          // 3. Suction towards center and lift along Z
+          const localLen = Math.hypot(localX, localY, localZ);
+          const pullDirX = localLen > 0.0001 ? -localX / localLen : 0;
+          const pullDirY = localLen > 0.0001 ? -localY / localLen : 0;
+          const pullDirZ = localLen > 0.0001 ? -localZ / localLen : 0;
+          
+          const pullStrength = falloff * scatterAmp * 2.0;
+          const liftStrength = falloff * scatterAmp * 4.0;
+          
+          twistedLocalX += pullDirX * pullStrength;
+          twistedLocalY += pullDirY * pullStrength;
+          twistedLocalZ += liftStrength + pullDirZ * pullStrength;
+          
+          // 4. Fluid Turbulence (multi-octave curl-like field)
+          let turbLocalX = 0, turbLocalY = 0, turbLocalZ = 0;
+          let amp = 1.0;
+          let freq = 2.0 / windRadius;
+          
+          for (let i = 0; i < 3; i++) {
+            const cx = twistedLocalX * freq;
+            const cy = twistedLocalY * freq;
+            const cz = twistedLocalZ * freq + time * scatterSpeed * 1.5;
+            
+            const sx = Math.sin(cy * 2.0);
+            const sy = Math.sin(cz * 2.0);
+            const sz = Math.sin(cx * 2.0);
+            
+            const cxVal = Math.cos(cz * 1.5);
+            const cyVal = Math.cos(cx * 1.5);
+            const czVal = Math.cos(cy * 1.5);
+            
+            turbLocalX += (sx + cxVal) * amp;
+            turbLocalY += (sy + cyVal) * amp;
+            turbLocalZ += (sz + czVal) * amp;
+            
+            amp *= 0.5;
+            freq *= 2.0;
+          }
+          
+          twistedLocalX += turbLocalX * falloff * scatterAmp * 3.0;
+          twistedLocalY += turbLocalY * falloff * scatterAmp * 3.0;
+          twistedLocalZ += turbLocalZ * falloff * scatterAmp * 3.0;
+          
+          // 5. Transform back to world space using invRotation (transpose)
+          const dispOffsetX = invRotation.elements[0] * twistedLocalX + invRotation.elements[3] * twistedLocalY + invRotation.elements[6] * twistedLocalZ;
+          const dispOffsetY = invRotation.elements[1] * twistedLocalX + invRotation.elements[4] * twistedLocalY + invRotation.elements[7] * twistedLocalZ;
+          const dispOffsetZ = invRotation.elements[2] * twistedLocalX + invRotation.elements[5] * twistedLocalY + invRotation.elements[8] * twistedLocalZ;
+          
+          // Mix and set final displaced world position
+          const finalOffsetX = dx * (1.0 - falloff) + dispOffsetX * falloff;
+          const finalOffsetY = dy * (1.0 - falloff) + dispOffsetY * falloff;
+          const finalOffsetZ = dz * (1.0 - falloff) + dispOffsetZ * falloff;
+          
+          let movX = finalOffsetX - dx;
+          let movY = finalOffsetY - dy;
+          let movZ = finalOffsetZ - dz;
+          
+          const moveLen = Math.hypot(movX, movY, movZ);
+          const maxMove = scatterAmp * 15.0;
+          if (moveLen > maxMove && maxMove > 0.0) {
+            movX *= (maxMove / moveLen);
+            movY *= (maxMove / moveLen);
+            movZ *= (maxMove / moveLen);
+          }
+          
+          fx = windCenter.x + dx + movX;
+          fy = windCenter.y + dy + movY;
+          fz = windCenter.z + dz + movZ;
+        }
       }
 
       // Compute base color
@@ -1484,6 +1771,10 @@ function exportJSON() {
 // Export High-Res PNG
 function exportPNG() {
   if (!renderer || !camera) return;
+
+  // Temporarily hide wind globe
+  const wasGlobeVisible = windGlobe ? windGlobe.visible : false;
+  if (windGlobe) windGlobe.visible = false;
   
   // Save current sizes
   const width = window.innerWidth;
@@ -1517,6 +1808,9 @@ function exportPNG() {
   
   // 3. Capture the image data URL
   const dataURL = renderer.domElement.toDataURL('image/png');
+
+  // Restore wind globe visibility
+  if (windGlobe) windGlobe.visible = wasGlobeVisible;
   
   // 4. Download it
   const a = document.createElement('a');
@@ -1567,7 +1861,7 @@ const PRESETS = {
     scatterAmp: 0,
     scatterFreq: 0.05,
     scatterSpeed: 0,
-    pointShape: 0,
+    pointShape: 1,
     pointOpacity: 0.60,
     colorMode: 'greyscale',
     exposure: 1.2,
@@ -1587,7 +1881,7 @@ const PRESETS = {
     scatterAmp: 5,
     scatterFreq: 0.05,
     scatterSpeed: 0.3,
-    pointShape: 0,
+    pointShape: 1,
     pointOpacity: 0.60,
     colorMode: 'original',
     exposure: 1.0,
@@ -1609,7 +1903,7 @@ const PRESETS = {
     scatterAmp: 12,
     scatterFreq: 0.05,
     scatterSpeed: 0.8,
-    pointShape: 0,
+    pointShape: 1,
     pointOpacity: 0.60,
     colorMode: 'monochrome',
     monochromeColor: '#00ffcc',
@@ -1679,7 +1973,17 @@ function initUniformsFromDOM() {
   
   shaderUniforms.uOrganicFieldStrength.value = parseFloat(document.getElementById('organic-field-strength').value);
   shaderUniforms.uOrganicFieldSpeed.value = parseFloat(document.getElementById('organic-field-speed').value);
-  shaderUniforms.uEnableFloating.value = document.getElementById('enable-organic-float').checked;
+  const enableFloat = document.getElementById('enable-organic-float').checked;
+  shaderUniforms.uEnableFloating.value = enableFloat;
+  
+  if (windGlobe) {
+    windGlobe.visible = enableFloat;
+    const modelScale = parseFloat(document.getElementById('model-scale').value);
+    const depthScale = parseFloat(document.getElementById('depth-scale').value);
+    const scatterFreq = parseFloat(document.getElementById('scatter-freq').value);
+    windGlobe.scale.setScalar(scatterFreq * modelScale);
+    windGlobe.position.z = depthScale * 0.5;
+  }
   
   if (bloomPass) {
     bloomPass.strength = parseFloat(document.getElementById('bloom-strength').value);
@@ -2352,6 +2656,42 @@ function playTimeline() {
 
 // --- User Interaction Listeners ---
 function setupEventListeners() {
+  // Raycaster for Wind Globe Dragging
+  window.addEventListener('pointerdown', (e) => {
+    if (!document.getElementById('enable-organic-float').checked || !windGlobe) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') return; // Ignore UI clicks
+    
+    mouseVector.x = (e.clientX / window.innerWidth) * 2 - 1;
+    mouseVector.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    globeRaycaster.setFromCamera(mouseVector, camera);
+    
+    const intersects = globeRaycaster.intersectObject(windGlobe);
+    if (intersects.length > 0) {
+      isDraggingGlobe = true;
+      if (controls) controls.enabled = false;
+    }
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!isDraggingGlobe || !windGlobe) return;
+    mouseVector.x = (e.clientX / window.innerWidth) * 2 - 1;
+    mouseVector.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    globeRaycaster.setFromCamera(mouseVector, camera);
+    
+    const target = new THREE.Vector3();
+    globeRaycaster.ray.intersectPlane(dragPlane, target);
+    if (target) {
+      windGlobe.position.copy(target);
+      windGlobeAnchor.copy(target);
+      shaderUniforms.uWindCenter.value.copy(windGlobe.position);
+    }
+  });
+
+  window.addEventListener('pointerup', () => {
+    isDraggingGlobe = false;
+    if (controls) controls.enabled = true;
+  });
+
   // Collapse/Expand UI panel
   const toggleBtn = document.getElementById('ui-toggle');
   const controlPanel = document.getElementById('control-panel');
@@ -2382,10 +2722,19 @@ function setupEventListeners() {
   sliders = [
     { id: 'res-step', unit: 'px', callback: buildParticles },
     { id: 'point-size', unit: '', callback: (v) => { shaderUniforms.uPointSize.value = v; } },
-    { id: 'model-scale', unit: '', callback: (v) => { shaderUniforms.uModelScale.value = v; } },
-    { id: 'depth-scale', unit: '', callback: (v) => { shaderUniforms.uDepthScale.value = v; } },
+    { id: 'model-scale', unit: '', callback: (v) => { 
+      shaderUniforms.uModelScale.value = v; 
+      if (windGlobe) windGlobe.scale.setScalar(shaderUniforms.uScatterFreq.value * v);
+    } },
+    { id: 'depth-scale', unit: '', callback: (v) => { 
+      shaderUniforms.uDepthScale.value = v; 
+      if (windGlobe) windGlobe.position.z = v * 0.5;
+    } },
     { id: 'scatter-amp', unit: '', callback: (v) => { shaderUniforms.uScatterAmp.value = v; } },
-    { id: 'scatter-freq', unit: '', callback: (v) => { shaderUniforms.uScatterFreq.value = v; } },
+    { id: 'scatter-freq', unit: '', callback: (v) => { 
+      shaderUniforms.uScatterFreq.value = v; 
+      if (windGlobe) windGlobe.scale.setScalar(v * shaderUniforms.uModelScale.value);
+    } },
     { id: 'scatter-speed', unit: '', callback: (v) => { shaderUniforms.uScatterSpeed.value = v; } },
     { id: 'point-opacity', unit: '', callback: (v) => { shaderUniforms.uPointOpacity.value = v; } },
     { id: 'alpha-threshold', unit: '', callback: (v) => { shaderUniforms.uAlphaThreshold.value = v; } },
@@ -2491,11 +2840,12 @@ function setupEventListeners() {
   enableShading.addEventListener('change', (e) => {
     shaderUniforms.uEnableShading.value = e.target.checked;
   });
-
+  
   const enableOrganicFloat = document.getElementById('enable-organic-float');
   if (enableOrganicFloat) {
     enableOrganicFloat.addEventListener('change', (e) => {
       shaderUniforms.uEnableFloating.value = e.target.checked;
+      if (windGlobe) windGlobe.visible = e.target.checked;
     });
   }
 
@@ -2530,6 +2880,17 @@ function setupEventListeners() {
   const pointShape = document.getElementById('point-shape');
   pointShape.addEventListener('change', (e) => {
     shaderUniforms.uPointShape.value = parseInt(e.target.value);
+  });
+
+  document.getElementById('enable-anti-alias')?.addEventListener('change', (e) => {
+    shaderUniforms.uAntiAlias.value = e.target.checked;
+  });
+
+  document.getElementById('enable-depth-write')?.addEventListener('change', (e) => {
+    if (particleSystem) {
+      particleSystem.material.depthWrite = e.target.checked;
+      particleSystem.material.needsUpdate = true;
+    }
   });
 
   // Color pickers
